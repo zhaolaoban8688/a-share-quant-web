@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#152b55"><meta name="apple-mobile-web-app-capable" content="yes">
-<title>A股波段量化扫描</title>
+<title>A股沪深主板波段量化扫描</title>
 <style>
 :root{--bg:#f3f6fb;--card:#fff;--ink:#172033;--muted:#748096;--line:#dfe5ef;--blue:#2457e6;--navy:#152b55;--green:#11855a;--red:#c23d46;--amber:#ad6700;--shadow:0 8px 28px rgba(25,45,85,.08)}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif}button,select{font:inherit}.hidden{display:none!important}
@@ -23,7 +23,7 @@ main{max-width:960px;margin:auto;padding:15px 13px calc(40px + env(safe-area-ins
 </style>
 </head>
 <body>
-<header><div><small>A股 1—6 周波段系统</small><h1>全市场量化扫描</h1></div><div class="headBtns"><button class="icon" id="refresh">↻</button></div></header>
+<header><div><small>A股 1—6 周波段系统</small><h1>沪深主板量化扫描</h1></div><div class="headBtns"><button class="icon" id="refresh">↻</button></div></header>
 <main>
 <div id="notice" class="notice">正在读取最新扫描结果…</div>
 <section class="hero"><div><span id="mode" class="badge">尚未扫描</span><h2 id="market">市场环境：—</h2><p id="meta">请先在GitHub Actions手动运行扫描</p></div><div class="breadth"><span>市场宽度</span><b id="breadth">—</b></div></section>
@@ -39,7 +39,7 @@ main{max-width:960px;margin:auto;padding:15px 13px calc(40px + env(safe-area-ins
 <script>
 let DATA=null,state='ALL';const $=x=>document.getElementById(x);const esc=s=>String(s??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 function n(v,d=2){return Number.isFinite(+v)?(+v).toFixed(d):'—'}function p(v){return Number.isFinite(+v)?n(v,1)+'%':'—'}
-async function load(){try{const r=await fetch('data/latest.json?t='+Date.now());if(!r.ok)throw Error('尚无扫描结果');DATA=await r.json();renderAll()}catch(e){$('notice').textContent='尚未生成全市场扫描结果。上传新版文件后，在GitHub Actions运行一次“收盘确认”或“盘中预警”。';$('empty').classList.remove('hidden')}}
+async function load(){try{const r=await fetch('data/latest.json?t='+Date.now());if(!r.ok)throw Error('尚无扫描结果');DATA=await r.json();renderAll()}catch(e){$('notice').textContent='尚未生成沪深主板扫描结果。上传新版文件后，在GitHub Actions运行一次“收盘确认”或“盘中预警”。';$('empty').classList.remove('hidden')}}
 function renderAll(){const m=DATA.meta,x=DATA.market,s=DATA.summary;$('mode').textContent=m.mode_name;$('market').textContent='市场环境：'+x.state;$('breadth').textContent=n(x.breadth,1)+'%';$('universe').textContent=m.history_success||m.universe_count;$('countA').textContent=s.A;$('countB').textContent=s.B;$('countC').textContent=s.C;$('meta').textContent=`${m.generated_at.replace('T',' ')}｜${m.data_source}｜耗时 ${m.elapsed_seconds}秒`;$('notice').innerHTML=m.warnings?.length?`<b>扫描成功</b>；${m.warnings.map(esc).join('；')}`:`扫描成功：共选出 ${s.total} 只，优先查看A类二次启动。`;
  const inds=[...new Set(DATA.candidates.map(x=>x.industry).filter(x=>x&&x!='未分类'))].sort();$('industry').innerHTML='<option value="">全部行业</option>'+inds.map(x=>`<option>${esc(x)}</option>`).join('');$('industries').innerHTML=(DATA.industry_ranking||[]).slice(0,12).map(x=>`<div><div class="iTop"><b>${esc(x.name)}</b><span>${p(x.change_pct)}｜强度 ${n(x.score,0)}</span></div><div class="bar"><i style="width:${x.score}%"></i></div></div>`).join('');renderCards()}
 function renderCards(){if(!DATA)return;const ind=$('industry').value,sort=$('sort').value;let a=DATA.candidates.filter(x=>(state==='ALL'||x.state===state)&&(!ind||x.industry===ind));a.sort((x,y)=>sort==='risk_pct'?(+x[sort]||99)-(+y[sort]||99):(+y[sort]||0)-(+x[sort]||0));$('empty').classList.toggle('hidden',a.length>0);$('list').innerHTML=a.map((x,i)=>{const ch=+x.change_pct||0;return `<article class="card" data-i="${DATA.candidates.indexOf(x)}"><div class="top"><div><b class="name">${esc(x.name)}</b><span class="code">${x.code}</span></div><span class="sig ${x.state}">${esc(x.signal)}</span></div><div class="priceRow"><div><span class="price">${n(x.price)}</span><span class="change ${ch>=0?'up':'down'}">${p(ch)}</span></div><div class="score" style="--score:${x.score}"><b>${n(x.score,0)}</b></div></div><div class="mini"><div><span>行业</span><b>${esc(x.industry)}</b></div><div><span>回踩量比</span><b>${n(x.pullback_volume_ratio)}</b></div><div><span>距MA20</span><b>${p(x.distance_ma20_pct)}</b></div><div><span>突破后</span><b>${x.days_after_breakout}日</b></div></div><div class="levels"><span>平台 <b>${n(x.platform)}</b></span><span>触发 <b>${n(x.trigger)}</b></span><span>止损 <b>${n(x.stop)}</b></span></div></article>`}).join('');document.querySelectorAll('.card').forEach(c=>c.onclick=()=>detail(DATA.candidates[+c.dataset.i]))}

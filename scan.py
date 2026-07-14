@@ -539,7 +539,11 @@ def build_industry_map(spot_codes: set[str], warnings: list[str]) -> tuple[dict[
 
 def choose_universe(spot: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     d = spot.copy()
-    d = d[d["code"].str.match(r"^(00|30|60|68)\d{4}$", na=False)]
+    # 仅扫描沪深主板：
+    # 深市主板 000/001/002/003；沪市主板 600/601/603/605。
+    # 明确排除创业板 300/301、科创板 688/689、北交所等。
+    mainboard_pattern = r"^(?:000|001|002|003|600|601|603|605)\d{3}$"
+    d = d[d["code"].str.match(mainboard_pattern, na=False)]
     d = d[~d["name"].astype(str).str.contains(r"ST|退|N |C ", case=False, regex=True, na=False)]
     d = d[(d["price"] >= args.min_price) & (d["price"] <= args.max_price)]
     d = d[d["amount"].fillna(0) >= args.min_amount_yi * 1e8]
@@ -667,6 +671,7 @@ def main() -> int:
             "status": "success",
             "mode": args.mode,
             "mode_name": "盘中预警" if args.mode == "intraday" else "收盘确认",
+            "market_scope": "A股沪深主板",
             "generated_at": generated.isoformat(timespec="seconds"),
             "market_date": generated.strftime("%Y-%m-%d"),
             "data_source": source + " + 腾讯日K",
