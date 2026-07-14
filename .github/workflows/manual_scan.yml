@@ -1,0 +1,82 @@
+name: A股全市场手动扫描
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 扫描模式
+        required: true
+        type: choice
+        default: close
+        options:
+          - intraday
+          - close
+      max_price:
+        description: 最高股价（元）
+        required: true
+        default: "150"
+      min_amount_yi:
+        description: 当日最低成交额（亿元；14:30建议0.6，收盘建议0.8）
+        required: true
+        default: "0.8"
+      max_stocks:
+        description: 最大扫描数（0=全部；首次试跑可填800）
+        required: true
+        default: "0"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: a-share-manual-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: 取出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装免费数据和计算依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "akshare>=1.18.0" "pandas>=2.1" "numpy>=1.26" "requests>=2.31"
+
+      - name: 扫描全A股
+        run: |
+          python scan.py \
+            --mode "${{ inputs.mode }}" \
+            --max-price "${{ inputs.max_price }}" \
+            --min-amount-yi "${{ inputs.min_amount_yi }}" \
+            --max-stocks "${{ inputs.max_stocks }}" \
+            --workers 28 \
+            --bars 280 \
+            --top 80
+
+      - name: 保存最新结果到网页
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/latest.json data/candidates.csv
+          if git diff --cached --quiet; then
+            echo "结果没有变化，无需提交"
+          else
+            git commit -m "scan: ${{ inputs.mode }} $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
+
+      - name: 上传CSV备份
+        uses: actions/upload-artifact@v4
+        with:
+          name: a-share-candidates-${{ inputs.mode }}
+          path: |
+            data/latest.json
+            data/candidates.csv
+          retention-days: 14
