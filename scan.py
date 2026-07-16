@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A股沪深主板缩量回踩精选扫描器 V3.3结构优先版.
+"""A股沪深主板缩量回踩精选扫描器 V3.4容错结构版.
 
 数据：AKShare 实时快照 + 腾讯日K（失败时回退 AKShare 个股日线）。
 输出：data/latest.json 与 data/candidates.csv。
@@ -86,7 +86,13 @@ def retry_call(fn, attempts: int = 3, base_sleep: float = 1.2):
 
 
 def normalize_spot(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize Eastmoney/Sina AKShare spot columns."""
+    """Normalize Eastmoney/Sina AKShare spot columns and unify volume to hands.
+
+    新浪成交量通常以“股”为单位，东财/腾讯日K多以“手”为单位。旧版仅按
+    全市场成交量中位数判断，遇到缩量日或数据分布变化时可能整批误判，导致
+    当日成交量被放大约100倍，所有股票都被“放量回调”条件淘汰。
+    V3.4改为逐股用 成交额≈价格×成交量×100 自动判断单位。
+    """
     df = df.copy()
     rename = {
         "代码": "code",
@@ -113,14 +119,24 @@ def normalize_spot(df: pd.DataFrame) -> pd.DataFrame:
         .str.replace("sz", "", regex=False).str.replace("bj", "", regex=False)
         .str.extract(r"(\d{6})", expand=False)
     )
-    for col in ["price", "change_pct", "volume", "amount", "high", "low", "open", "prev_close", "volume_ratio", "turnover", "r60_spot"]:
+    numeric_cols = [
+        "price", "change_pct", "volume", "amount", "high", "low", "open",
+        "prev_close", "volume_ratio", "turnover", "r60_spot",
+    ]
+    for col in numeric_cols:
         if col not in df.columns:
             df[col] = np.nan
         df[col] = pd.to_numeric(df[col], errors="coerce")
-    # 新浪接口成交量单位为股；东财为手。按数量级与成交额粗略统一成手。
-    median_vol = df["volume"].replace(0, np.nan).median()
-    if math.isfinite(num(median_vol)) and median_vol > 1e7:
-        df["volume"] = df["volume"] / 100.0
+
+    valid = (df["price"] > 0) & (df["volume"] > 0) & (df["amount"] > 0)
+    # amount / (price * volume): 若volume为股，约等于1；若volume为手，约等于100。
+    unit_ratio = df.loc[valid, "amount"] / (
+        df.loc[valid, "price"] * df.loc[valid, "volume"]
+    ).replace(0, np.nan)
+    share_unit = unit_ratio.between(0.15, 8.0, inclusive="both")
+    df.loc[unit_ratio.index[share_unit], "volume"] = (
+        df.loc[unit_ratio.index[share_unit], "volume"] / 100.0
+    )
     return df
 
 
@@ -206,18 +222,41 @@ def fetch_history(code: str, bars: int = 280) -> tuple[str, pd.DataFrame | None,
 
 
 def merge_spot_bar(hist: pd.DataFrame, row: pd.Series, scan_time: datetime) -> pd.DataFrame:
-    """Merge intraday/final snapshot as current date bar."""
-    h = hist.copy()
+    """Merge snapshot into current date bar without corrupting volume units.
+
+    若腾讯/AKShare历史日K已经含有当天K线，优先保留历史源成交量；仅用实时
+    快照更新收盘价及高低价。这样即使新浪快照偶发单位异常，也不会让当天量能
+    被放大100倍。盘中尚无当日历史K线时，再追加已经自动换算为“手”的快照。
+    """
+    h = hist.copy().reset_index(drop=True)
     today = pd.Timestamp(scan_time.date())
     price, opn, high, low = [num(row.get(c)) for c in ("price", "open", "high", "low")]
     vol, amount = num(row.get("volume"), 0), num(row.get("amount"), 0)
     if not all(math.isfinite(x) and x > 0 for x in (price, opn, high, low)):
-        return h
-    new = {"date": today, "open": opn, "close": price, "high": high, "low": low, "volume": max(vol, 0), "amount": max(amount, 0)}
+        return h.tail(300).reset_index(drop=True)
+
     if not h.empty and pd.Timestamp(h.iloc[-1]["date"]).normalize() == today:
-        for k, v in new.items():
-            h.at[h.index[-1], k] = v
+        i = h.index[-1]
+        old_open = num(h.at[i, "open"])
+        old_high = num(h.at[i, "high"])
+        old_low = num(h.at[i, "low"])
+        old_vol = num(h.at[i, "volume"], 0)
+        old_amount = num(h.at[i, "amount"], 0)
+        h.at[i, "open"] = old_open if math.isfinite(old_open) and old_open > 0 else opn
+        h.at[i, "close"] = price
+        h.at[i, "high"] = max(high, old_high if math.isfinite(old_high) else high)
+        h.at[i, "low"] = min(low, old_low if math.isfinite(old_low) and old_low > 0 else low)
+        # 两源量能相差20倍以上时视为单位异常，保留历史源；否则取较完整者。
+        if old_vol > 0 and vol > 0 and max(old_vol, vol) / max(min(old_vol, vol), 1e-9) > 20:
+            h.at[i, "volume"] = old_vol
+        else:
+            h.at[i, "volume"] = max(old_vol, vol)
+        h.at[i, "amount"] = max(old_amount, amount)
     else:
+        new = {
+            "date": today, "open": opn, "close": price, "high": high, "low": low,
+            "volume": max(vol, 0), "amount": max(amount, 0),
+        }
         h = pd.concat([h, pd.DataFrame([new])], ignore_index=True)
     return h.tail(300).reset_index(drop=True)
 
@@ -286,16 +325,13 @@ def local_low(d: pd.DataFrame, idx: int, radius: int = 2) -> bool:
 
 
 def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
-    """识别“主升—温和缩量回踩—MA20/MA30支撑”结构。
+    """V3.4：结构打分式识别“上涨—缩量回踩—MA20/MA30企稳”。
 
-    V3.3结构优先版：
-    1. 硬条件只判断结构是否成立，不再用多层高分阈值重复淘汰；
-    2. A类允许确认后1—3日迅速离开均线；
-    3. B类允许在MA20/MA30附近横盘或温和阴线等待确认；
-    4. 综合分只负责排序，不再决定“有没有候选”。
+    不再要求每个理想特征全部同时成立。趋势破坏、放量杀跌等红线仍是硬条件；
+    主升量能、回调速度、均线触碰和阳线确认采用容错组合，综合质量只用于排序。
     """
     n = len(d)
-    if n < 110:
+    if n < 100:
         return None
 
     latest = d.iloc[-1]
@@ -307,99 +343,100 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
     ma20_slope5 = ma20 / max(num(d.iloc[-6]["ma20"]), 1e-9) - 1
     ma30_slope5 = ma30 / max(num(d.iloc[-6]["ma30"]), 1e-9) - 1
     ma60_slope10 = ma60 / max(num(d.iloc[-11]["ma60"]), 1e-9) - 1
-
-    # 只保留真正的中期趋势红线。回踩阶段MA20短暂下弯是正常现象。
+    # 只保留中期趋势红线；允许回踩时MA20短暂走平或轻微下弯。
     if not (
-        price >= ma30 * 0.94
-        and price >= ma60 * 0.95
-        and ma20 >= ma30 * 0.88
-        and ma30 >= ma60 * 0.90
-        and ma20_slope5 >= -0.060
-        and ma30_slope5 >= -0.040
-        and ma60_slope10 >= -0.045
+        price >= ma30 * 0.90
+        and price >= ma60 * 0.92
+        and ma20 >= ma30 * 0.84
+        and ma30 >= ma60 * 0.86
+        and ma20_slope5 >= -0.085
+        and ma30_slope5 >= -0.060
+        and ma60_slope10 >= -0.060
     ):
         return None
 
     best: PullbackSetup | None = None
     best_quality = -1e9
 
-    # 峰值允许出现在最近2—30个交易日前，覆盖2日急回踩和1—6周整理。
-    for peak_idx in range(max(65, n - 31), n - 1):
-        if not local_peak(d, peak_idx, 2):
-            continue
+    # 局部峰值 + 多窗口最高点，避免“不是标准局部顶”导致整只股票漏检。
+    peak_candidates: set[int] = set()
+    for i in range(max(60, n - 38), n - 1):
+        if local_peak(d, i, 2):
+            peak_candidates.add(i)
+    for lookback in (8, 12, 18, 25, 35):
+        left = max(60, n - 1 - lookback)
+        right = n - 2
+        if right >= left:
+            peak_candidates.add(int(d.iloc[left:right + 1]["high"].idxmax()))
 
+    for peak_idx in sorted(peak_candidates):
         pullback_days = n - 1 - peak_idx
-        if not 1 <= pullback_days <= 30:
+        if not 1 <= pullback_days <= 36:
             continue
-
         peak_high = num(d.iloc[peak_idx]["high"])
         peak_close = num(d.iloc[peak_idx]["close"])
         if not all(math.isfinite(x) and x > 0 for x in (peak_high, peak_close)):
             continue
 
-        # 用多个窗口寻找主升起点，兼容快速主升、平台突破和大盘股缓慢抬升。
         start_candidates: set[int] = set()
         right = peak_idx - 2
-        for lookback in (10, 15, 20, 30, 45, 55):
-            left = max(50, peak_idx - lookback)
+        for lookback in (10, 15, 22, 30, 45, 60):
+            left = max(40, peak_idx - lookback)
             if right > left:
                 start_candidates.add(int(d.iloc[left:right + 1]["low"].idxmin()))
-        left_all = max(50, peak_idx - 55)
-        for i in range(left_all, right + 1):
+        for i in range(max(40, peak_idx - 60), right + 1):
             if local_low(d, i, 2):
                 start_candidates.add(i)
 
         for start_idx in sorted(start_candidates):
             impulse_days = peak_idx - start_idx
-            if not 3 <= impulse_days <= 55:
+            if not 3 <= impulse_days <= 60:
                 continue
-
             start_low = num(d.iloc[start_idx]["low"])
             impulse_gain = peak_high / max(start_low, 1e-9) - 1
-            # 不再把强趋势股因涨幅过大直接误删，评分阶段再降低追高优先级。
-            if not 0.08 <= impulse_gain <= 3.00:
+            if not 0.10 <= impulse_gain <= 3.50:
                 continue
 
-            impulse = d.iloc[start_idx + 1: peak_idx + 1].copy()
+            impulse = d.iloc[start_idx + 1:peak_idx + 1].copy()
             prior = d.iloc[max(0, start_idx - 20):start_idx].copy()
             if len(impulse) < 3 or len(prior) < 8:
                 continue
-
             prior_vol = num(prior["volume"].median())
             impulse_vol = num(impulse["volume"].mean())
-            if not math.isfinite(prior_vol) or prior_vol <= 0 or not math.isfinite(impulse_vol):
+            if not math.isfinite(prior_vol) or prior_vol <= 0 or not math.isfinite(impulse_vol) or impulse_vol <= 0:
                 continue
 
             impulse_volume_ratio = impulse_vol / prior_vol
             day_volume_ratio = impulse["volume"] / impulse["vma20"].replace(0, np.nan)
-            impulse_max_volume_ratio = num(day_volume_ratio.max())
-            impulse_returns = impulse["close"].pct_change().fillna(
-                impulse.iloc[0]["close"] / max(num(d.iloc[start_idx]["close"]), 1e-9) - 1
-            )
-            strong_up_days = int(((impulse_returns >= 0.015) & (day_volume_ratio >= 0.95)).sum())
+            impulse_max_volume_ratio = num(day_volume_ratio.max(), 0)
+            impulse_returns = impulse["close"].pct_change().fillna(0)
+            strong_up_days = int(((impulse_returns >= 0.015) & (day_volume_ratio >= 0.85)).sum())
             path = d.iloc[start_idx:peak_idx + 1]["close"].astype(float)
             impulse_efficiency = (
                 (num(path.iloc[-1]) - num(path.iloc[0]))
                 / max(num(path.diff().abs().sum()), 1e-9)
             )
-
-            volume_ok = impulse_volume_ratio >= 0.82 or impulse_max_volume_ratio >= 1.08
-            strength_ok = strong_up_days >= 1 or impulse_gain >= 0.14
-            if not (volume_ok and strength_ok and impulse_efficiency >= 0.06):
+            # 量能只要求“平均放量/单日放量/上涨效率”三者满足其一，避免慢牛误杀。
+            impulse_evidence = sum([
+                impulse_volume_ratio >= 0.78,
+                impulse_max_volume_ratio >= 1.05,
+                strong_up_days >= 1,
+                impulse_efficiency >= 0.18,
+            ])
+            if impulse_evidence < 1 or impulse_efficiency < 0.02:
                 continue
 
             pull = d.iloc[peak_idx + 1:n].copy()
             if pull.empty:
                 continue
-
             pullback_low = num(pull["low"].min())
             drawdown = (peak_high - pullback_low) / peak_high
             pullback_speed = drawdown / max(pullback_days, 1)
             current_from_peak = price / peak_high - 1
             if not (
-                0.012 <= drawdown <= 0.32
-                and pullback_speed <= 0.050
-                and -0.32 <= current_from_peak <= 0.12
+                0.018 <= drawdown <= 0.38
+                and pullback_speed <= 0.065
+                and -0.38 <= current_from_peak <= 0.10
             ):
                 continue
 
@@ -409,7 +446,7 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
             ).pct_change().dropna()
             min_day = num(pull_returns.min(), 0)
             min_two_day = num((1 + pull_returns).rolling(2).apply(np.prod, raw=True).min() - 1, 0)
-            if min_day < -0.105 or min_two_day < -0.18:
+            if min_day < -0.115 or min_two_day < -0.205:
                 continue
 
             pull_vol = num(pull["volume"].mean())
@@ -418,42 +455,44 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
             down_vol = num(pull.loc[down_mask, "volume"].mean(), pull_vol)
             down_volume_ratio = down_vol / max(impulse_vol, 1e-9)
             distribution = pull[
-                (pull["close"].pct_change() <= -0.065)
-                & (pull["volume"] >= pull["vma20"] * 1.90)
+                (pull["close"].pct_change() <= -0.070)
+                & (pull["volume"] >= pull["vma20"] * 2.20)
             ]
-            if contraction > 1.25 or down_volume_ratio > 1.32 or len(distribution) > 0:
+            # 只把真正放量杀跌作为红线；普通量能回踩不再淘汰。
+            if contraction > 1.65 or down_volume_ratio > 1.75 or len(distribution) > 1:
                 continue
 
-            # 近10日逐日比较低点与当日MA20/MA30，不使用当前均线倒推历史。
-            recent = d.iloc[-10:].copy()
+            recent = d.iloc[-12:].copy()
             support_options: list[tuple[float, str, float, float, int]] = []
             for name, col, current_support in (("MA20", "ma20", ma20), ("MA30", "ma30", ma30)):
-                signed = recent["low"] / recent[col].replace(0, np.nan) - 1
-                valid = signed.dropna()
+                signed_low = recent["low"] / recent[col].replace(0, np.nan) - 1
+                signed_close = recent["close"] / recent[col].replace(0, np.nan) - 1
+                combined = pd.concat([signed_low.abs(), signed_close.abs()], axis=1).min(axis=1)
+                valid = combined.dropna()
                 if valid.empty:
                     continue
-                idx = int(valid.abs().idxmin())
-                support_options.append((abs(num(signed.loc[idx])), name, current_support, num(signed.loc[idx]), idx))
+                idx = int(valid.idxmin())
+                signed = num(signed_low.loc[idx]) if abs(num(signed_low.loc[idx])) <= abs(num(signed_close.loc[idx])) else num(signed_close.loc[idx])
+                support_options.append((num(valid.loc[idx]), name, current_support, signed, idx))
             if not support_options:
                 continue
-
             _, support_name, support, support_distance, touch_idx = min(support_options, key=lambda x: x[0])
             touch_age = n - 1 - touch_idx
-            ma30_hold_ratio = float((pull["close"] >= pull["ma30"].replace(0, np.nan) * 0.91).mean())
+            ma30_hold_ratio = float((pull["close"] >= pull["ma30"].replace(0, np.nan) * 0.88).mean())
+            # 允许盘中刺穿/确认后离开均线，但必须在最近12日实际接近过MA20/30。
             if not (
-                -0.085 <= support_distance <= 0.105
-                and touch_age <= 9
-                and price >= support * 0.94
-                and ma30_hold_ratio >= 0.40
+                -0.115 <= support_distance <= 0.125
+                and touch_age <= 11
+                and price >= support * 0.90
+                and ma30_hold_ratio >= 0.28
             ):
                 continue
 
-            # A类：最近3日出现有效确认。确认可为强阳、收复前高或长下影止跌。
             confirm_age = 99
             confirmation_return = num(latest["close"] / max(num(d.iloc[-2]["close"]), 1e-9) - 1, 0)
             confirmation_strength = 0.0
             confirm_low = math.nan
-            for age in range(0, 3):
+            for age in range(0, 4):
                 idx = n - 1 - age
                 if idx <= 0 or idx < touch_idx:
                     continue
@@ -465,22 +504,22 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
                 close_pos = (num(row["close"]) - num(row["low"])) / rng
                 lower_shadow = (min(num(row["open"]), num(row["close"])) - num(row["low"])) / rng
                 support_day = num(row["ma20"] if support_name == "MA20" else row["ma30"])
-                bullish_body = num(row["close"]) >= num(row["open"]) * 0.995
-                reclaim = num(row["close"]) >= num(prev_row["high"]) * 0.985
+                bullish = num(row["close"]) >= num(row["open"]) * 0.992
+                reclaim = num(row["close"]) >= num(prev_row["high"]) * 0.982
                 is_confirm = (
-                    bullish_body
-                    and -0.002 <= ret <= 0.105
-                    and close_pos >= 0.48
-                    and num(row["close"]) >= support_day * 0.975
-                    and (body >= 0.001 or lower_shadow >= 0.18 or reclaim)
+                    bullish
+                    and -0.012 <= ret <= 0.115
+                    and close_pos >= 0.42
+                    and num(row["close"]) >= support_day * 0.955
+                    and (body >= -0.002 or lower_shadow >= 0.16 or reclaim)
                 )
                 if is_confirm:
                     confirm_age = age
                     confirmation_return = ret
                     confirmation_strength = (
                         clamp(close_pos, 0, 1) * 0.40
-                        + clamp((ret + 0.010) / 0.11, 0, 1) * 0.30
-                        + clamp(lower_shadow / 0.45, 0, 1) * 0.15
+                        + clamp((ret + 0.015) / 0.13, 0, 1) * 0.25
+                        + clamp(lower_shadow / 0.45, 0, 1) * 0.20
                         + clamp(max(body, 0) / 0.07, 0, 1) * 0.15
                     )
                     confirm_low = num(row["low"])
@@ -491,42 +530,40 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
             latest_volume_ratio_to_impulse = num(latest["volume"]) / max(impulse_vol, 1e-9)
 
             state = "B"
-            if confirm_age <= 2 and price >= max(support * 0.965, confirm_low * 0.985):
+            if confirm_age <= 3 and price >= max(support * 0.94, confirm_low * 0.975):
                 state = "A"
-
             if state == "A":
-                if latest_volume_ratio_to_impulse > 2.20:
+                if price > support * 1.24 or latest_volume_ratio_to_impulse > 3.20:
                     continue
             else:
-                # B类只排除明显破位，不因一根普通阴线误杀。
                 if (
-                    latest_ret < -0.065
-                    or stable_range > 0.25
-                    or latest_volume_ratio_to_impulse > 1.75
-                    or price < support * 0.94
+                    latest_ret < -0.080
+                    or stable_range > 0.32
+                    or latest_volume_ratio_to_impulse > 2.60
+                    or price < support * 0.90
+                    or price > support * 1.18
                 ):
                     continue
                 rng = max(num(latest["high"]) - num(latest["low"]), 1e-9)
                 close_pos = (price - num(latest["low"])) / rng
                 confirmation_strength = (
-                    clamp(close_pos, 0, 1) * 0.45
-                    + clamp((latest_ret + 0.065) / 0.10, 0, 1) * 0.25
-                    + clamp((0.25 - stable_range) / 0.25, 0, 1) * 0.30
+                    clamp(close_pos, 0, 1) * 0.40
+                    + clamp((latest_ret + 0.080) / 0.13, 0, 1) * 0.25
+                    + clamp((0.32 - stable_range) / 0.32, 0, 1) * 0.35
                 )
                 confirmation_return = latest_ret
                 confirm_age = 99
 
             quality = (
-                min(impulse_gain, 1.50) * 35
-                + min(impulse_volume_ratio, 2.5) * 5
+                min(impulse_gain, 1.50) * 30
+                + min(impulse_volume_ratio, 2.5) * 4
                 + impulse_efficiency * 8
-                - pullback_speed * 120
-                - abs(drawdown - 0.11) * 14
-                - contraction * 3
+                - pullback_speed * 100
+                - abs(drawdown - 0.12) * 12
+                - max(contraction - 0.80, 0) * 3
                 + confirmation_strength * 10
                 + (5 if state == "A" else 0)
             )
-
             if quality > best_quality:
                 best_quality = quality
                 best = PullbackSetup(
@@ -551,7 +588,6 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
                     confirmation_strength=confirmation_strength,
                     confirmation_age=confirm_age,
                 )
-
     return best
 
 
@@ -582,18 +618,13 @@ def analyze_stock(
     dist20 = price / ma20 - 1 if ma20 > 0 else math.nan
     dist30 = price / ma30 - 1 if ma30 > 0 else math.nan
 
-    # A类刚刚确认时可以迅速离开均线；B类仍必须靠近支撑。
+    # V3.4不再用“距均线+10日涨幅”重复淘汰；只排除确认后明显加速远离支撑。
     if not math.isfinite(atr) or atr <= 0:
         return None
-    if setup.state == "A":
-        if setup.confirmation_age <= 1:
-            if dist20 > 0.30 or dist30 > 0.38 or r10 > 0.55:
-                return None
-        elif dist20 > 0.23 or dist30 > 0.31 or r10 > 0.45:
-            return None
-    else:
-        if dist20 > 0.16 or dist30 > 0.20 or r10 > 0.36:
-            return None
+    if setup.state == "A" and (dist20 > 0.38 and dist30 > 0.42 and r10 > 0.65):
+        return None
+    if setup.state == "B" and (dist20 > 0.24 and dist30 > 0.26):
+        return None
 
     ma20_slope5 = ma20 / max(num(d.iloc[-6]["ma20"]), 1e-9) - 1
     ma30_slope5 = ma30 / max(num(d.iloc[-6]["ma30"]), 1e-9) - 1
@@ -656,7 +687,7 @@ def analyze_stock(
     if risk_pct < 0.022:
         stop = trigger * 0.975
         risk_pct = 0.025
-    risk_cap = 0.22 if setup.state == "A" else 0.17
+    risk_cap = 0.25 if setup.state == "A" else 0.21
     if risk_pct > risk_cap:
         return None
     target = trigger + 2.0 * (trigger - stop)
@@ -672,7 +703,7 @@ def analyze_stock(
     )
     score = clamp(score, 0, 100)
 
-    # V3.3：综合分只负责同类排序，不再作为第二套硬门槛。
+    # V3.4：综合分只负责同类排序，不再作为第二套硬门槛。
     # 前面的趋势、主升、缩量回踩、均线支撑和破位过滤已经构成完整硬条件。
 
     change_pct = num(spot_row.get("change_pct"))
@@ -937,8 +968,8 @@ def main() -> int:
             -num(x["amount_yi"], 0),
         )
     )
-    # 结构优先版：确认型最多12只，待确认最多12只。
-    caps = {"A": 12, "B": 12}
+    # 容错结构版：确认型最多15只，待确认最多15只。
+    caps = {"A": 15, "B": 15}
     selected: list[dict[str, Any]] = []
     counts = {"A": 0, "B": 0, "C": 0}
     for x in candidates:
@@ -949,7 +980,7 @@ def main() -> int:
 
     generated = datetime.now(SH_TZ)
     payload = {
-        "schema": 4,
+        "schema": 5,
         "meta": {
             "status": "success",
             "mode": args.mode,
