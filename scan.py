@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A股沪深主板缩量回踩精选扫描器 V3.
+"""A股沪深主板缩量回踩精选扫描器 V3.1平衡版.
 
 数据：AKShare 实时快照 + 腾讯日K（失败时回退 AKShare 个股日线）。
 输出：data/latest.json 与 data/candidates.csv。
@@ -287,9 +287,10 @@ def local_low(d: pd.DataFrame, idx: int, radius: int = 2) -> bool:
 def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
     """识别“放量主升—温和缩量回踩—MA20/MA30企稳”结构。
 
-    只保留两类：
-    A：最新一日已经收阳确认，可重点复核；
-    B：结构合格但尚未收阳确认，只放观察池。
+    V3.1平衡版：
+    A：最新一日已经收阳确认；
+    B：结构合格但尚待收阳确认。
+    红线条件仍一票否决，其余通过评分优选，避免全市场零候选。
     """
     n = len(d)
     if n < 110:
@@ -302,31 +303,32 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
     if not all(math.isfinite(x) and x > 0 for x in (price, ma20, ma30, ma60)):
         return None
 
-    # 趋势必须已经形成，且中期均线仍然向上；不做下跌趋势中的反抽。
     ma20_slope5 = ma20 / max(num(d.iloc[-6]["ma20"]), 1e-9) - 1
     ma30_slope5 = ma30 / max(num(d.iloc[-6]["ma30"]), 1e-9) - 1
     ma60_slope10 = ma60 / max(num(d.iloc[-11]["ma60"]), 1e-9) - 1
+
+    # 保留趋势底线，但允许正常回踩时MA20短暂走平。
     if not (
-        price >= ma30 * 0.985
-        and price > ma60
-        and ma20 >= ma30 * 0.985
-        and ma30 >= ma60 * 0.965
-        and ma20_slope5 >= 0.0
-        and ma30_slope5 >= -0.003
-        and ma60_slope10 >= -0.012
+        price >= ma30 * 0.97
+        and price >= ma60 * 0.98
+        and ma20 >= ma30 * 0.97
+        and ma30 >= ma60 * 0.94
+        and ma20_slope5 >= -0.005
+        and ma30_slope5 >= -0.008
+        and ma60_slope10 >= -0.020
     ):
         return None
 
     best: PullbackSetup | None = None
     best_quality = -1e9
 
-    # 前一波高点应距离现在2—15个交易日，符合1—6周波段的中继节奏。
-    for peak_idx in range(max(75, n - 16), n - 2):
+    # 高点距离现在2—18日，兼容稍长一些的温和整理。
+    for peak_idx in range(max(70, n - 19), n - 2):
         if not local_peak(d, peak_idx, 2):
             continue
 
         pullback_days = n - 1 - peak_idx
-        if not 2 <= pullback_days <= 15:
+        if not 2 <= pullback_days <= 18:
             continue
 
         peak_high = num(d.iloc[peak_idx]["high"])
@@ -334,11 +336,12 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
         if not all(math.isfinite(x) and x > 0 for x in (peak_high, peak_close)):
             continue
 
-        # 主升起点从高点前4—22日的局部低点中寻找。
-        start_left = max(60, peak_idx - 22)
+        # 主升段允许4—28日。
+        start_left = max(55, peak_idx - 30)
         start_right = peak_idx - 3
         if start_right <= start_left:
             continue
+
         start_candidates = [
             i for i in range(start_left, start_right + 1)
             if local_low(d, i, 2)
@@ -348,12 +351,12 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
 
         for start_idx in start_candidates:
             impulse_days = peak_idx - start_idx
-            if not 4 <= impulse_days <= 20:
+            if not 4 <= impulse_days <= 28:
                 continue
 
             start_low = num(d.iloc[start_idx]["low"])
             impulse_gain = peak_high / max(start_low, 1e-9) - 1
-            if not 0.12 <= impulse_gain <= 0.55:
+            if not 0.10 <= impulse_gain <= 0.60:
                 continue
 
             impulse = d.iloc[start_idx + 1: peak_idx + 1].copy()
@@ -373,7 +376,7 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
                 impulse.iloc[0]["close"] / max(num(d.iloc[start_idx]["close"]), 1e-9) - 1
             )
             strong_up_days = int(
-                ((impulse_returns >= 0.025) & (day_volume_ratio >= 1.10)).sum()
+                ((impulse_returns >= 0.022) & (day_volume_ratio >= 1.05)).sum()
             )
             path = d.iloc[start_idx:peak_idx + 1]["close"].astype(float)
             impulse_efficiency = (
@@ -381,11 +384,12 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
                 / max(num(path.diff().abs().sum()), 1e-9)
             )
 
+            # 主升必须真实存在，但不再要求四项同时达到极高阈值。
             if not (
-                impulse_volume_ratio >= 1.15
-                and impulse_max_volume_ratio >= 1.38
-                and (strong_up_days >= 2 or impulse_gain >= 0.22)
-                and impulse_efficiency >= 0.34
+                impulse_volume_ratio >= 1.05
+                and impulse_max_volume_ratio >= 1.25
+                and (strong_up_days >= 1 or impulse_gain >= 0.18)
+                and impulse_efficiency >= 0.22
             ):
                 continue
 
@@ -398,11 +402,11 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
             pullback_speed = drawdown / max(pullback_days, 1)
             current_from_peak = price / peak_high - 1
 
-            # 回调必须“慢而有序”，拒绝瀑布式杀跌和深度破位。
+            # 红线：深跌、快速下杀、已经重新大幅创新高。
             if not (
-                0.025 <= drawdown <= 0.18
-                and pullback_speed <= 0.024
-                and -0.18 <= current_from_peak <= 0.015
+                0.02 <= drawdown <= 0.22
+                and pullback_speed <= 0.032
+                and -0.22 <= current_from_peak <= 0.03
             ):
                 continue
 
@@ -415,7 +419,7 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
                 (1 + pull_returns).rolling(2).apply(np.prod, raw=True).min() - 1,
                 0,
             )
-            if min_day < -0.065 or min_two_day < -0.095:
+            if min_day < -0.08 or min_two_day < -0.12:
                 continue
 
             pull_vol = num(pull["volume"].mean())
@@ -424,45 +428,44 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
             down_vol = num(pull.loc[down_mask, "volume"].mean(), pull_vol)
             down_volume_ratio = down_vol / max(impulse_vol, 1e-9)
 
-            # 放量长阴代表派发，而不是健康回踩。
+            # 只排除明显放量长阴派发；普通回调量能交给评分处理。
             distribution = pull[
-                (pull["close"].pct_change() <= -0.045)
-                & (pull["volume"] >= pull["vma20"] * 1.30)
+                (pull["close"].pct_change() <= -0.055)
+                & (pull["volume"] >= pull["vma20"] * 1.50)
             ]
-            if (
-                contraction > 0.80
-                or down_volume_ratio > 0.78
-                or len(distribution) > 0
-            ):
+            if contraction > 0.98 or down_volume_ratio > 1.00 or len(distribution) > 0:
                 continue
 
-            # 支撑可以是MA20或MA30，选择最新K线低点更接近的一条。
+            # 使用近5日最低点判断是否完成过MA20/MA30回踩。
+            recent5 = d.iloc[-5:]
+            recent_low = num(recent5["low"].min())
             supports = {"MA20": ma20, "MA30": ma30}
             support_name, support = min(
                 supports.items(),
-                key=lambda kv: abs(num(latest["low"]) / max(kv[1], 1e-9) - 1),
+                key=lambda kv: abs(recent_low / max(kv[1], 1e-9) - 1),
             )
-            support_distance = num(latest["low"]) / support - 1
-            recent3 = d.iloc[-3:]
+            support_distance = recent_low / support - 1
+
             recent_support_touch = (
-                num(recent3["low"].min()) <= support * 1.04
-                and num(recent3["close"].min()) >= support * 0.975
+                recent_low <= support * 1.06
+                and num(recent5["close"].min()) >= support * 0.94
             )
-            ma30_hold = bool(
+            ma30_hold_ratio = float(
                 (
                     pull["close"]
-                    >= pull["ma30"].replace(0, np.nan) * 0.96
-                ).all()
+                    >= pull["ma30"].replace(0, np.nan) * 0.94
+                ).mean()
             )
+
             if not (
-                -0.032 <= support_distance <= 0.04
-                and price >= support * 0.995
+                -0.05 <= support_distance <= 0.06
+                and price >= support * 0.985
                 and recent_support_touch
-                and ma30_hold
+                and ma30_hold_ratio >= 0.75
             ):
                 continue
 
-            # 企稳确认：收阳、收盘高于前收、收在K线中上部，且不是大幅追高。
+            # 阳线确认仍要求最新日有企稳动作，但允许小阳、下影线反包。
             rng = max(num(latest["high"]) - num(latest["low"]), 1e-9)
             close_position = (price - num(latest["low"])) / rng
             confirmation_return = price / max(num(prev["close"]), 1e-9) - 1
@@ -471,50 +474,50 @@ def find_pullback_setup(d: pd.DataFrame) -> PullbackSetup | None:
                 min(num(latest["open"]), price) - num(latest["low"])
             ) / rng
             stable_range = (
-                num(recent3["close"].max()) / max(num(recent3["close"].min()), 1e-9) - 1
+                num(recent5["close"].max()) / max(num(recent5["close"].min()), 1e-9) - 1
             )
+
             confirmation = (
-                price > num(latest["open"])
-                and confirmation_return >= 0.001
-                and confirmation_return <= 0.058
-                and close_position >= 0.55
-                and price >= support * 1.003
-                and stable_range <= 0.065
+                price > num(latest["open"]) * 0.998
+                and confirmation_return >= 0.0
+                and confirmation_return <= 0.065
+                and close_position >= 0.50
+                and price >= support * 0.99
+                and stable_range <= 0.09
                 and (
-                    body_return >= 0.004
-                    or lower_shadow >= 0.28
-                    or price >= num(prev["high"]) * 0.998
+                    body_return >= 0.002
+                    or lower_shadow >= 0.22
+                    or price >= num(prev["high"]) * 0.995
                 )
             )
 
             latest_volume_ratio_to_impulse = num(latest["volume"]) / max(impulse_vol, 1e-9)
-            if latest_volume_ratio_to_impulse > 1.18:
+            if latest_volume_ratio_to_impulse > 1.35:
                 continue
 
             state = "A" if confirmation else "B"
             if state == "B":
-                # 待确认池仍要求价格没有继续加速下跌。
-                if confirmation_return < -0.018 or stable_range > 0.07:
+                if confirmation_return < -0.03 or stable_range > 0.10:
                     continue
 
             confirmation_strength = (
-                clamp(close_position, 0, 1) * 0.40
-                + clamp((confirmation_return + 0.01) / 0.05, 0, 1) * 0.30
-                + clamp(lower_shadow / 0.45, 0, 1) * 0.15
-                + clamp((0.065 - stable_range) / 0.065, 0, 1) * 0.15
+                clamp(close_position, 0, 1) * 0.38
+                + clamp((confirmation_return + 0.012) / 0.06, 0, 1) * 0.27
+                + clamp(lower_shadow / 0.45, 0, 1) * 0.18
+                + clamp((0.09 - stable_range) / 0.09, 0, 1) * 0.17
             )
 
-            # 用于多个候选结构之间取最优，不直接等于最终综合分。
             quality = (
-                impulse_gain * 70
-                + min(impulse_volume_ratio, 2.5) * 7
-                + impulse_efficiency * 12
-                - pullback_speed * 260
-                - abs(drawdown - 0.085) * 35
-                - contraction * 8
+                impulse_gain * 65
+                + min(impulse_volume_ratio, 2.5) * 6
+                + impulse_efficiency * 10
+                - pullback_speed * 210
+                - abs(drawdown - 0.09) * 28
+                - contraction * 6
                 + confirmation_strength * 12
                 + (5 if state == "A" else 0)
             )
+
             if quality > best_quality:
                 best_quality = quality
                 best = PullbackSetup(
@@ -570,9 +573,9 @@ def analyze_stock(
 
     # 避免已经再次加速、离均线太远的股票。
     if (
-        dist20 > 0.105
-        or dist30 > 0.125
-        or r10 > 0.28
+        dist20 > 0.14
+        or dist30 > 0.16
+        or r10 > 0.32
         or not math.isfinite(atr)
         or atr <= 0
     ):
@@ -638,10 +641,10 @@ def analyze_stock(
     if risk_pct < 0.022:
         stop = trigger * 0.975
         risk_pct = 0.025
-    if risk_pct > 0.105:
+    if risk_pct > 0.13:
         return None
     target = trigger + 2.0 * (trigger - stop)
-    risk_score = clamp((0.105 - risk_pct) / 0.083 * 5, 0, 5)
+    risk_score = clamp((0.13 - risk_pct) / 0.105 * 5, 0, 5)
 
     score = (
         trend_score
@@ -654,7 +657,7 @@ def analyze_stock(
     score = clamp(score, 0, 100)
 
     # 优中选优：确认型和观察型都设最低门槛。
-    threshold = 80 if setup.state == "A" else 77
+    threshold = 75 if setup.state == "A" else 70
     if score < threshold:
         return None
 
@@ -919,13 +922,13 @@ def main() -> int:
             -num(x["amount_yi"], 0),
         )
     )
-    # 优中选优：确认型最多15只，待确认最多10只。
-    caps = {"A": 15, "B": 10}
+    # 平衡版：确认型最多15只，待确认最多15只。
+    caps = {"A": 15, "B": 15}
     selected: list[dict[str, Any]] = []
     counts = {"A": 0, "B": 0, "C": 0}
     for x in candidates:
         s = x["state"]
-        if s in caps and counts[s] < caps[s] and len(selected) < min(args.top, 25):
+        if s in caps and counts[s] < caps[s] and len(selected) < min(args.top, 30):
             selected.append(x)
             counts[s] += 1
 
