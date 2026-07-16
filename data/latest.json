@@ -5,14 +5,14 @@
     "mode": "close",
     "mode_name": "收盘确认",
     "market_scope": "A股沪深主板",
-    "generated_at": "2026-07-16T19:31:21+08:00",
+    "generated_at": "2026-07-16T20:02:02+08:00",
     "market_date": "2026-07-16",
     "data_source": "AKShare-新浪 + 腾讯日K",
     "snapshot_count": 5528,
-    "universe_count": 1883,
-    "history_success": 1874,
+    "universe_count": 1906,
+    "history_success": 1897,
     "history_failed": 9,
-    "elapsed_seconds": 165.8,
+    "elapsed_seconds": 252.9,
     "warnings": [
       "东方财富实时快照失败：ConnectionError",
       "行业映射失败，板块分按中性处理：ConnectionError",
@@ -21,9 +21,9 @@
     "disclaimer": "仅供量化研究与复盘，不构成投资建议。盘中信号尚未收盘确认。"
   },
   "market": {
-    "breadth": 43.4,
+    "breadth": 43.2,
     "state": "偏弱",
-    "median_r20_pct": -6.14
+    "median_r20_pct": -6.2
   },
   "summary": {
     "total": 0,
