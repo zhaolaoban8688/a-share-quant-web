@@ -23,7 +23,7 @@ main{max-width:960px;margin:auto;padding:15px 13px calc(40px + env(safe-area-ins
 </style>
 </head>
 <body>
-<header><div><small>A股沪深主板 · 1—6周波段</small><h1>缩量回踩精选 V3.2</h1></div><button class="icon" id="refresh">↻</button></header>
+<header><div><small>A股沪深主板 · 1—6周波段</small><h1>缩量回踩精选 V3.3</h1></div><button class="icon" id="refresh">↻</button></header>
 <main>
 <div id="notice" class="notice">正在读取最新扫描结果…</div>
 <section class="hero"><div><span id="mode" class="badge">尚未扫描</span><h2 id="market">市场环境：—</h2><p id="meta">放量主升 → 温和缩量回调 → MA20/MA30企稳</p></div><div class="breadth"><span>市场宽度</span><b id="breadth">—</b></div></section>
@@ -31,7 +31,7 @@ main{max-width:960px;margin:auto;padding:15px 13px calc(40px + env(safe-area-ins
 <section class="actions"><a class="btn primary" href="https://github.com/zhaolaoban8688/a-share-quant-web/actions/workflows/manual_scan.yml" target="_blank">启动手动扫描</a><a class="btn secondary" href="data/candidates.csv" download>下载候选CSV</a></section>
 <nav class="tabs"><button class="tab active" data-state="A">核心确认</button><button class="tab" data-state="B">等待确认</button><button class="tab" data-state="ALL">全部</button></nav>
 <div class="filters"><select id="sort"><option value="score">按综合分</option><option value="pullback_speed_pct_day">按回调速度</option><option value="pullback_volume_ratio">按缩量程度</option><option value="industry_score">按板块强度</option><option value="risk_pct">按风险距离</option></select><select id="industry"><option value="">全部行业</option></select></div>
-<div id="list" class="list"></div><div id="empty" class="empty hidden">当前没有达到样本校准版最低分的股票。若仍为0，请查看扫描日志中的数据源与历史行情完整性。</div>
+<div id="list" class="list"></div><div id="empty" class="empty hidden">当前没有达到结构条件的股票。若仍为0，请检查扫描日志；V3.3已取消综合分硬门槛，仅保留结构红线。</div>
 <h3 class="sectionTitle">强势行业</h3><section id="industries" class="industry"></section>
 <p class="foot">形态是第一过滤条件，行业强度只做小幅加减分。网页不连接券商、不自动交易。结果仅供研究与复盘，不构成投资建议。</p>
 </main>
