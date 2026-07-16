@@ -1,4 +1,4 @@
-name: A股沪深主板手动扫描
+name: A股沪深主板缩量回踩精选
 
 on:
   workflow_dispatch:
@@ -49,7 +49,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install "akshare>=1.18.0" "baostock>=0.8.9" "pandas>=2.1" "numpy>=1.26" "requests>=2.31"
 
-      - name: 扫描沪深主板
+      - name: 扫描缩量回踩精选形态
         run: |
           python scan.py \
             --mode "${{ inputs.mode }}" \
@@ -58,7 +58,7 @@ jobs:
             --max-stocks "${{ inputs.max_stocks }}" \
             --workers 28 \
             --bars 280 \
-            --top 80
+            --top 30
 
       - name: 补充行业和板块强度
         run: |
