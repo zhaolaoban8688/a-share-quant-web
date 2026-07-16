@@ -1,18 +1,18 @@
 {
-  "schema": 3,
+  "schema": 4,
   "meta": {
     "status": "success",
     "mode": "close",
     "mode_name": "收盘确认",
     "market_scope": "A股沪深主板",
-    "generated_at": "2026-07-16T18:54:10+08:00",
+    "generated_at": "2026-07-16T19:31:21+08:00",
     "market_date": "2026-07-16",
     "data_source": "AKShare-新浪 + 腾讯日K",
     "snapshot_count": 5528,
     "universe_count": 1883,
     "history_success": 1874,
     "history_failed": 9,
-    "elapsed_seconds": 122.6,
+    "elapsed_seconds": 165.8,
     "warnings": [
       "东方财富实时快照失败：ConnectionError",
       "行业映射失败，板块分按中性处理：ConnectionError",
