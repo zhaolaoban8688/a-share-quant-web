@@ -1,4 +1,4 @@
-name: A股沪深主板缩量回踩精选
+name: A股沪深主板缩量回踩精选V3.1
 
 on:
   workflow_dispatch:
