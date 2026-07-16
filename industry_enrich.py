@@ -180,9 +180,13 @@ def build_industry_scores(
 def write_candidates_csv(candidates: list[dict[str, Any]]) -> None:
     fields = [
         "state", "signal", "score", "code", "name", "industry",
-        "price", "change_pct", "platform", "breakout_date",
-        "days_after_breakout", "breakout_volume_ratio",
-        "pullback_volume_ratio", "distance_ma20_pct", "r10_pct",
+        "price", "change_pct", "impulse_start_date", "impulse_peak_date",
+        "impulse_gain_pct", "impulse_days", "impulse_volume_ratio",
+        "impulse_max_volume_ratio", "pullback_days", "drawdown_pct",
+        "pullback_speed_pct_day", "pullback_volume_ratio",
+        "down_volume_ratio", "support_name", "support_price",
+        "support_distance_pct", "confirmation_return_pct",
+        "distance_ma20_pct", "distance_ma30_pct", "r10_pct",
         "r20_pct", "industry_score", "trigger", "stop",
         "target_2r", "risk_pct", "risk_reward", "amount_yi",
         "turnover",
@@ -269,13 +273,13 @@ def main() -> int:
             industry_scores.get(industry), 50.0
         )
         old_relative = to_float(
-            item.get("relative_strength"), 7.5
+            item.get("relative_strength"), 2.5
         )
         new_relative = clamp(
             old_relative
-            + (new_industry_score - old_industry_score) * 0.075,
+            + (new_industry_score - old_industry_score) * 0.03,
             0.0,
-            15.0,
+            5.0,
         )
         old_score = to_float(item.get("score"), 0.0)
         new_score = clamp(
@@ -301,7 +305,7 @@ def main() -> int:
                 f"{new_industry_score:.1f}",
             )
 
-    state_order = {"A": 0, "B": 1, "C": 2}
+    state_order = {"A": 0, "B": 1}
     candidates.sort(
         key=lambda x: (
             state_order.get(str(x.get("state")), 9),
