@@ -1,4 +1,4 @@
-name: A股沪深主板双买点结构扫描 V4.1
+name: A股沪深主板双买点结构扫描 V4.3
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
           - intraday
           - close
       near_tolerance:
-        description: 均线或结构支撑附近允许偏差（0.15=15%）
+        description: 均线或结构支撑最大允许偏差（0.15=15%；买点一确认收盘另限8%）
         required: true
         default: "0.15"
       max_stocks:
@@ -63,14 +63,14 @@ jobs:
           if git diff --cached --quiet; then
             echo "结果没有变化，无需提交"
           else
-            git commit -m "scan V4.1: ${{ inputs.mode }} $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git commit -m "scan V4.3: ${{ inputs.mode }} $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
           fi
 
       - name: 上传结果备份
         uses: actions/upload-artifact@v4
         with:
-          name: a-share-v41-candidates-${{ inputs.mode }}
+          name: a-share-v43-candidates-${{ inputs.mode }}
           path: |
             data/latest.json
             data/candidates.csv
