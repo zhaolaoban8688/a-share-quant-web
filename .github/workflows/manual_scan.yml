@@ -1,4 +1,4 @@
-name: A股沪深主板双买点结构扫描 V4.3
+name: A股沪深主板四买点结构扫描 V4.4
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ on:
           - intraday
           - close
       near_tolerance:
-        description: 均线或结构支撑最大允许偏差（0.15=15%；买点一确认收盘另限8%）
+        description: 买点一均线最大允许偏差（0.15=15%）
         required: true
         default: "0.15"
       max_stocks:
@@ -45,15 +45,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install "akshare>=1.18.0" "pandas>=2.1" "numpy>=1.26" "requests>=2.31"
 
-      - name: 扫描沪深主板双买点结构
+      - name: 扫描沪深主板四买点结构
         run: |
           python scan.py \
             --mode "${{ inputs.mode }}" \
             --near-tolerance "${{ inputs.near_tolerance }}" \
+            --structure-tolerance "0.05" \
             --max-stocks "${{ inputs.max_stocks }}" \
             --workers 28 \
             --bars 320 \
-            --top 40
+            --top 52
 
       - name: 保存最新结果到网页
         run: |
@@ -63,14 +64,14 @@ jobs:
           if git diff --cached --quiet; then
             echo "结果没有变化，无需提交"
           else
-            git commit -m "scan V4.3: ${{ inputs.mode }} $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git commit -m "scan V4.4: ${{ inputs.mode }} $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
           fi
 
       - name: 上传结果备份
         uses: actions/upload-artifact@v4
         with:
-          name: a-share-v43-candidates-${{ inputs.mode }}
+          name: a-share-v44-candidates-${{ inputs.mode }}
           path: |
             data/latest.json
             data/candidates.csv
