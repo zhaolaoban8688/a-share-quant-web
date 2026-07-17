@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A股沪深主板双买点结构扫描器 V4.1.
+"""A股沪深主板双买点结构扫描器 V4.2.
 
 数据：AKShare 实时快照 + 腾讯日K（失败时回退 AKShare 个股日线）。
 输出：data/latest.json 与 data/candidates.csv。
@@ -373,7 +373,7 @@ def is_large_bullish_confirmation(d: pd.DataFrame, idx: int) -> tuple[bool, floa
 
 
 def find_impulses(d: pd.DataFrame, confirm_idx: int) -> list[Impulse]:
-    """寻找近期位于MA20/MA30之上的放量破前高上涨段（V4.1容错版）。"""
+    """寻找近期位于MA20/MA30之上的放量破前高上涨段（V4.2风控版）。"""
     out: list[Impulse] = []
     left_bound = max(65, confirm_idx - 120)
     right_bound = confirm_idx - 2
@@ -451,7 +451,7 @@ def find_impulses(d: pd.DataFrame, confirm_idx: int) -> list[Impulse]:
 
 
 def find_structural_levels(d: pd.DataFrame, end_idx: int, lookback: int = 180) -> list[StructuralLevel]:
-    """识别明显前波峰/前波谷，V4.1适度降低幅度门槛。"""
+    """识别明显前波峰/前波谷，V4.2沿用结构幅度门槛。"""
     levels: list[StructuralLevel] = []
     start = max(25, end_idx - lookback)
     stop = min(end_idx - 3, len(d) - 4)
@@ -646,7 +646,7 @@ def evaluate_setup_at(
 
 
 def find_buy_setup(d: pd.DataFrame, tolerance: float = 0.15) -> tuple[BuySetup | None, str]:
-    """V4.1：确认阳线允许出现在最近3个交易日；无确认时输出等待确认。"""
+    """V4.2：最近3日确认；并执行买点一/买点二的收盘失效规则。"""
     if len(d) < 110:
         return None, "数据不足"
     furthest = "无上涨段"
@@ -709,15 +709,32 @@ def analyze_stock(
 
     confirm_row = d.iloc[setup.confirmation_idx]
     confirm_close = num(confirm_row["close"])
-    # 最近1—3日信号若已经大幅脱离确认K线或跌破支撑，则不再输出，避免追高/失效。
-    if setup.state in {"A", "B"} and setup.confirmation_age > 0:
-        if price > confirm_close * 1.10 or price < setup.support_price * 0.95:
-            return None, "信号已过期"
+
+    # V4.2收盘失效规则：
+    # 1）买点一（含等待确认的均线回踩结构）：最新收盘价跌破MA30，立即失效；
+    # 2）买点二（含等待确认的结构支撑形态）：最新收盘价跌破识别出的前波峰/前波谷支撑，立即失效。
+    is_ma_setup = setup.support_name in {"MA20", "MA30"}
+    is_structure_setup = setup.support_name in {"前波峰", "前波谷"}
+    if is_ma_setup and price < ma30:
+        return None, "买点一已失效·收盘跌破MA30"
+    if is_structure_setup and price < setup.support_price:
+        return None, "买点二已失效·收盘跌破结构支撑"
+
+    # 最近1—3日信号若已经较确认K线大幅上涨，则不再输出，避免追高。
+    if setup.state in {"A", "B"} and setup.confirmation_age > 0 and price > confirm_close * 1.10:
+        return None, "信号已过期·偏离确认K线过远"
+
     recent_low = num(d.iloc[max(impulse.peak_idx + 1, len(d) - 8):]["low"].min())
     trigger = num(confirm_row["high"]) * 1.002
-    stop = min(recent_low, setup.support_price) * 0.975
+    # 页面“失效参考”与硬规则保持一致，不再额外预留2.5%的模糊空间。
+    if is_ma_setup:
+        stop = ma30
+        invalidation_rule = "收盘价跌破MA30"
+    else:
+        stop = setup.support_price
+        invalidation_rule = f"收盘价跌破{setup.support_name}支撑"
     if stop <= 0 or stop >= trigger:
-        stop = trigger * 0.94
+        stop = min(recent_low, trigger * 0.94)
     risk_pct = (trigger - stop) / trigger
     target = trigger + 2 * (trigger - stop)
 
@@ -763,6 +780,8 @@ def analyze_stock(
         "target_2r": round(target, 3),
         "risk_pct": pct(risk_pct),
         "risk_reward": 2.0,
+        "invalidation_rule": invalidation_rule,
+        "invalidation_level": round(stop, 3),
         "amount_yi": safe_round(num(spot_row.get("amount")) / 1e8, 2),
         "turnover": safe_round(spot_row.get("turnover"), 2),
         "volume_ratio_spot": safe_round(spot_row.get("volume_ratio"), 2),
@@ -789,7 +808,7 @@ def analyze_stock(
                 if setup.state != "W"
                 else "结构已经回踩到位，但最新K线尚未形成实体大于前一根的确认阳线"
             ),
-            f"触发 {trigger:.2f} / 结构失效参考 {stop:.2f} / 2R参考 {target:.2f}",
+            f"触发 {trigger:.2f} / 失效线 {stop:.2f}（{invalidation_rule}）/ 2R参考 {target:.2f}",
         ],
     }, stage
 
@@ -973,8 +992,8 @@ def main() -> int:
 
     generated = datetime.now(SH_TZ)
     payload = {
-        "schema": 7,
-        "strategy_version": "V4.1",
+        "schema": 8,
+        "strategy_version": "V4.2",
         "meta": {
             "status": "success",
             "mode": args.mode,
@@ -1006,7 +1025,7 @@ def main() -> int:
         },
         "diagnostics": {
             "stages": dict(stage_counts.most_common()),
-            "explanation": "V4.1按无上涨段→有上涨段→回调合格→已到支撑→等待确认/已确认记录最远通过阶段。",
+            "explanation": "V4.2按无上涨段→有上涨段→回调合格→已到支撑→等待确认/已确认记录，并执行收盘失效规则。",
         },
         "industry_ranking": industry_ranking,
         "candidates": selected,
