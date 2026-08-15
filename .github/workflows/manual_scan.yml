@@ -1,10 +1,10 @@
-name: A股沪深主板四买点结构扫描 V4.4
+name: A股沪深主板四买点结构扫描 V5.0
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 扫描模式
+        description: 扫描模式（收盘后优先用 close）
         required: true
         type: choice
         default: close
@@ -12,9 +12,17 @@ on:
           - intraday
           - close
       near_tolerance:
-        description: 买点一均线最大允许偏差（0.15=15%）
+        description: 买点一最低收盘距离MA20最大偏差（0.10=10%）
         required: true
-        default: "0.15"
+        default: "0.10"
+      structure_tolerance:
+        description: 买点二/三/四支撑最大偏差（0.05=5%）
+        required: true
+        default: "0.05"
+      max_contraction:
+        description: 回调缩量上限（回调中位量/上涨段中位量，0.85=85%）
+        required: true
+        default: "0.85"
       max_stocks:
         description: 最大扫描数（0=沪深主板全部）
         required: true
@@ -24,13 +32,13 @@ permissions:
   contents: write
 
 concurrency:
-  group: a-share-manual-scan
+  group: a-share-manual-scan-v50
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 55
+    timeout-minutes: 60
     steps:
       - name: 取出仓库代码
         uses: actions/checkout@v4
@@ -40,39 +48,41 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: 安装免费数据和计算依赖
+      - name: 安装免费数据与计算依赖
         run: |
           python -m pip install --upgrade pip
           pip install "akshare>=1.18.0" "pandas>=2.1" "numpy>=1.26" "requests>=2.31"
 
-      - name: 扫描沪深主板四买点结构
+      - name: 扫描沪深主板四买点结构 V5.0
         run: |
           python scan.py \
             --mode "${{ inputs.mode }}" \
             --near-tolerance "${{ inputs.near_tolerance }}" \
-            --structure-tolerance "0.05" \
+            --structure-tolerance "${{ inputs.structure_tolerance }}" \
+            --max-contraction "${{ inputs.max_contraction }}" \
             --max-stocks "${{ inputs.max_stocks }}" \
             --workers 28 \
-            --bars 320 \
-            --top 52
+            --bars 360 \
+            --top 56
 
-      - name: 保存最新结果到网页
+      - name: 保存最新结果与K线图到网页
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/latest.json data/candidates.csv
+          git add data/latest.json data/candidates.csv data/charts
           if git diff --cached --quiet; then
             echo "结果没有变化，无需提交"
           else
-            git commit -m "scan V4.4: ${{ inputs.mode }} $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git commit -m "scan V5.0: ${{ inputs.mode }} $(date -u +'%Y-%m-%d %H:%M UTC')"
             git push
           fi
 
-      - name: 上传结果备份
+      - name: 上传扫描结果备份
         uses: actions/upload-artifact@v4
         with:
-          name: a-share-v44-candidates-${{ inputs.mode }}
+          name: a-share-v50-candidates-${{ inputs.mode }}
           path: |
             data/latest.json
             data/candidates.csv
+            data/charts/*.svg
           retention-days: 14
