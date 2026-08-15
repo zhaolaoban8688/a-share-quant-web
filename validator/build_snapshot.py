@@ -173,7 +173,7 @@ def market_score(frame: pd.DataFrame) -> tuple[float, dict[str, float]]:
 
 def quality_proxy(row: pd.Series) -> float:
     """短中期基础质量代理，不冒充真实基本面/催化评分。"""
-    score = 2.0  # 通过主板/ST/成交数据卫生过滤
+    score = 2.0
     amount_yi = num(row.get("amount_yi"))
     pe = num(row.get("pe"))
     pb = num(row.get("pb"))
@@ -216,7 +216,6 @@ def add_scores(frame: pd.DataFrame, industry_current: dict[str, float], market_s
     d = d.join(groups, on="industry")
     d["industry_current"] = d["industry"].map(industry_current).fillna(50.0)
 
-    market_r5 = num(d["r5"].median(), 0)
     market_r20 = num(d["r20"].median(), 0)
     market_r60 = num(d["r60"].median(), 0)
 
@@ -245,7 +244,6 @@ def add_scores(frame: pd.DataFrame, industry_current: dict[str, float], market_s
         )
 
         r5 = num(row.get("r5"), 0)
-        r10 = num(row.get("r10"), 0)
         r20 = num(row.get("r20"), 0)
         r60 = num(row.get("r60"), 0)
         rs = (
@@ -268,7 +266,7 @@ def add_scores(frame: pd.DataFrame, industry_current: dict[str, float], market_s
 
         total = clamp(market_sc + mainline + sector + funds + fundamental + rs + risk, 0, 100)
         veto = None
-        if atr_pct > 0.13:
+        if math.isfinite(atr_pct) and atr_pct > 0.13:
             veto = "波动率过高（ATR14/价格>13%）"
         elif dd > 0.35:
             veto = "近20日回撤过深（>35%）"
@@ -302,15 +300,22 @@ def add_scores(frame: pd.DataFrame, industry_current: dict[str, float], market_s
 
 
 def clean_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, (str, bool)):
+        return value
+    if isinstance(value, list):
+        return [clean_json_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): clean_json_value(v) for k, v in value.items()}
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating, float)):
         return None if not math.isfinite(float(value)) else round(float(value), 6)
     if isinstance(value, (np.bool_,)):
         return bool(value)
-    if pd.isna(value):
-        return None
-    return value
+    try:
+        return None if bool(pd.isna(value)) else value
+    except (TypeError, ValueError):
+        return str(value)
 
 
 def main() -> int:
