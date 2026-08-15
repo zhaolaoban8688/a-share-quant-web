@@ -7,6 +7,10 @@ on:
         description: 最大处理股票数（0=沪深主板全部；调试可填300）
         required: true
         default: "0"
+  pull_request:
+    paths:
+      - "validator/**"
+      - ".github/workflows/meta_validator_snapshot.yml"
   schedule:
     - cron: "40 7 * * 1-5"  # 北京时间工作日15:40左右
 
@@ -14,7 +18,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: a-share-meta-validator-v11
+  group: a-share-meta-validator-v11-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -35,11 +39,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install "akshare>=1.18.0" "pandas>=2.1" "numpy>=1.26" "requests>=2.31"
 
-      - name: 生成二次验证全市场快照
+      - name: Python语法检查
+        run: python -m py_compile validator/build_snapshot.py
+
+      - name: 生成二次验证快照
+        env:
+          INPUT_MAX_STOCKS: ${{ github.event.inputs.max_stocks }}
         run: |
-          python validator/build_snapshot.py --max-stocks "${{ github.event.inputs.max_stocks || '0' }}" --workers 28 --bars 180
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            MAX_STOCKS=300
+          elif [ -n "$INPUT_MAX_STOCKS" ]; then
+            MAX_STOCKS="$INPUT_MAX_STOCKS"
+          else
+            MAX_STOCKS=0
+          fi
+          echo "本次 max_stocks=$MAX_STOCKS"
+          python validator/build_snapshot.py --max-stocks "$MAX_STOCKS" --workers 28 --bars 180
 
       - name: 保存验证快照
+        if: github.event_name != 'pull_request'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -54,6 +72,6 @@ jobs:
       - name: 上传快照备份
         uses: actions/upload-artifact@v4
         with:
-          name: meta-validator-v11-snapshot
+          name: meta-validator-v11-snapshot-${{ github.event_name }}
           path: validator/data/latest.json
           retention-days: 14
