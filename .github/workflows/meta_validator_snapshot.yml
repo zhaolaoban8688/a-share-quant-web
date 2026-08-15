@@ -1,0 +1,78 @@
+name: A股波段二次验证器 V1.1 数据快照
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_stocks:
+        description: 最大处理股票数（0=沪深主板全部；调试可填300）
+        required: true
+        default: "0"
+  pull_request:
+    paths:
+      - "validator/**"
+      - ".github/workflows/meta_validator_snapshot.yml"
+  schedule:
+    - cron: "40 7 * * 1-5"  # 北京时间工作日15:40左右
+
+permissions:
+  contents: write
+
+concurrency:
+  group: a-share-meta-validator-v11-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: 取出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install "akshare>=1.18.0" "pandas>=2.1" "numpy>=1.26" "requests>=2.31"
+
+      - name: Python语法检查
+        run: PYTHONPATH="${{ github.workspace }}" python -m py_compile validator/build_snapshot.py
+
+      - name: 生成二次验证快照
+        env:
+          INPUT_MAX_STOCKS: ${{ github.event.inputs.max_stocks }}
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            MAX_STOCKS=300
+          elif [ -n "$INPUT_MAX_STOCKS" ]; then
+            MAX_STOCKS="$INPUT_MAX_STOCKS"
+          else
+            MAX_STOCKS=0
+          fi
+          echo "本次 max_stocks=$MAX_STOCKS"
+          python validator/build_snapshot.py --max-stocks "$MAX_STOCKS" --workers 28 --bars 180
+
+      - name: 保存验证快照
+        if: github.event_name != 'pull_request'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add validator/data/latest.json
+          if git diff --cached --quiet; then
+            echo "验证快照无变化"
+          else
+            git commit -m "validator V1.1 snapshot $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
+
+      - name: 上传快照备份
+        uses: actions/upload-artifact@v4
+        with:
+          name: meta-validator-v11-snapshot-${{ github.event_name }}
+          path: validator/data/latest.json
+          retention-days: 14
