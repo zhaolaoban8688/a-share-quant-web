@@ -1,0 +1,9 @@
+{
+  "name": "A股波段二次验证器 V1.1",
+  "short_name": "波段验证器",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f3f6fb",
+  "theme_color": "#152b55",
+  "description": "A股沪深主板候选池二次量化验证与排名"
+}
