@@ -40,11 +40,12 @@ jobs:
           pip install "akshare>=1.18.0" "pandas>=2.1" "numpy>=1.26" "requests>=2.31"
 
       - name: Python语法检查
-        run: python -m py_compile validator/build_snapshot.py
+        run: PYTHONPATH="${{ github.workspace }}" python -m py_compile validator/build_snapshot.py
 
       - name: 生成二次验证快照
         env:
           INPUT_MAX_STOCKS: ${{ github.event.inputs.max_stocks }}
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             MAX_STOCKS=300
