@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""A股沪深主板四买点结构扫描器 V4.4.
+"""A股沪深主板四买点结构扫描器 V5.0.
 
-数据：AKShare 实时快照 + 腾讯日K（失败时回退 AKShare 个股日线）。
-输出：data/latest.json 与 data/candidates.csv。
-
-策略：买点一=MA20/MA30缩量回踩确认；
-买点二=跌破均线后回踩前波峰；买点三=回踩邻近前波谷；
-买点四=跌破邻近波谷后，逐级寻找更低且水平线不穿实体的历史波谷。
+核心规则：近期在MA20之上出现放量破前高上涨；随后缩量回调。
+买点一=回踩MA20且收盘不破MA20；买点二=跌破MA20后回踩邻近前高；
+买点三=继续回踩邻近前低；买点四=前低失效后逐级寻找更低历史波谷。
+所有买点仅认可最新K线：收阳、实体大于上一根、成交量大于上一根。
+输出 data/latest.json、data/candidates.csv 与候选SVG日K图。
 
 仅用于研究与复盘，不构成投资建议。
 """
@@ -235,10 +234,13 @@ def merge_spot_bar(hist: pd.DataFrame, row: pd.Series, scan_time: datetime) -> p
     """
     h = hist.copy().reset_index(drop=True)
     today = pd.Timestamp(scan_time.date())
+    # 周末不把周五快照伪造成周末K线。法定休市日若快照与历史末价几乎一致，也保留历史末K。
+    if scan_time.weekday() >= 5:
+        return h.tail(360).reset_index(drop=True)
     price, opn, high, low = [num(row.get(c)) for c in ("price", "open", "high", "low")]
     vol, amount = num(row.get("volume"), 0), num(row.get("amount"), 0)
     if not all(math.isfinite(x) and x > 0 for x in (price, opn, high, low)):
-        return h.tail(300).reset_index(drop=True)
+        return h.tail(360).reset_index(drop=True)
 
     if not h.empty and pd.Timestamp(h.iloc[-1]["date"]).normalize() == today:
         i = h.index[-1]
@@ -258,12 +260,17 @@ def merge_spot_bar(hist: pd.DataFrame, row: pd.Series, scan_time: datetime) -> p
             h.at[i, "volume"] = max(old_vol, vol)
         h.at[i, "amount"] = max(old_amount, amount)
     else:
+        if not h.empty:
+            last_close = num(h.iloc[-1]["close"])
+            last_date = pd.Timestamp(h.iloc[-1]["date"]).normalize()
+            if last_date < today and last_close > 0 and abs(price / last_close - 1) < 0.0005:
+                return h.tail(360).reset_index(drop=True)
         new = {
             "date": today, "open": opn, "close": price, "high": high, "low": low,
             "volume": max(vol, 0), "amount": max(amount, 0),
         }
         h = pd.concat([h, pd.DataFrame([new])], ignore_index=True)
-    return h.tail(300).reset_index(drop=True)
+    return h.tail(360).reset_index(drop=True)
 
 
 def ema(s: pd.Series, span: int) -> pd.Series:
@@ -272,7 +279,7 @@ def ema(s: pd.Series, span: int) -> pd.Series:
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy().reset_index(drop=True)
-    for n in (5, 10, 20, 30, 60):
+    for n in (5, 10, 20, 60):
         d[f"ma{n}"] = d["close"].rolling(n).mean()
     d["vma5"] = d["volume"].rolling(5).mean()
     d["vma10"] = d["volume"].rolling(10).mean()
@@ -306,8 +313,9 @@ class Impulse:
     peak_high: float
     gain: float
     breakout_volume_ratio: float
-    segment_volume_ratio: float
-    above_ma_ratio: float
+    impulse_volume_ratio: float
+    above_ma20_ratio: float
+    impulse_volume_median: float
 
 
 @dataclass
@@ -317,12 +325,13 @@ class StructuralLevel:
     price: float
     move_before: float
     move_after: float
+    validations: int = 1
 
 
 @dataclass
 class BuySetup:
-    state: str
     buy_point: int
+    state: str
     signal: str
     impulse: Impulse
     pullback_days: int
@@ -331,122 +340,141 @@ class BuySetup:
     support_name: str
     support_price: float
     support_distance: float
-    support_date: str
+    support_idx: int
     touch_idx: int
     confirmation_idx: int
-    confirmation_age: int
     confirmation_body_ratio: float
     confirmation_body_pct: float
+    confirmation_volume_ratio: float
     confirmation_return: float
-    broke_both_ma: bool
-    structural_amplitude: float
-    invalidation_margin: float
+    broke_ma20: bool
+    support_validations: int
+    confirmation_above_ma20: bool
 
 
 def local_peak(d: pd.DataFrame, idx: int, radius: int = 3) -> bool:
-    left = max(0, idx - radius)
-    right = min(len(d), idx + radius + 1)
+    if idx < radius or idx + radius >= len(d):
+        return False
+    window = d.iloc[idx - radius:idx + radius + 1]
     v = num(d.iloc[idx]["high"])
-    return math.isfinite(v) and v >= num(d.iloc[left:right]["high"].max()) * 0.998
+    return math.isfinite(v) and v >= num(window["high"].max()) * 0.998
 
 
 def local_low(d: pd.DataFrame, idx: int, radius: int = 3) -> bool:
-    left = max(0, idx - radius)
-    right = min(len(d), idx + radius + 1)
+    if idx < radius or idx + radius >= len(d):
+        return False
+    window = d.iloc[idx - radius:idx + radius + 1]
     v = num(d.iloc[idx]["low"])
-    return math.isfinite(v) and v <= num(d.iloc[left:right]["low"].min()) * 1.002
+    return math.isfinite(v) and v <= num(window["low"].min()) * 1.002
 
 
 def body_size(row: pd.Series) -> float:
     return abs(num(row["close"]) - num(row["open"]))
 
 
-def is_large_bullish_confirmation(d: pd.DataFrame, idx: int) -> tuple[bool, float, float, float]:
-    """确认日只能是最新K线：收阳且实体严格大于上一根K线实体。"""
+def is_confirmation_candle(d: pd.DataFrame, idx: int) -> tuple[bool, float, float, float, float]:
+    """最新K线必须：阳线、实体大于上一根、成交量大于上一根。"""
     if idx < 1:
-        return False, 0.0, 0.0, 0.0
+        return False, 0.0, 0.0, 0.0, 0.0
     cur, prev = d.iloc[idx], d.iloc[idx - 1]
-    opn, close = num(cur["open"]), num(cur["close"])
-    prev_close = num(prev["close"])
-    if not all(math.isfinite(x) and x > 0 for x in (opn, close, prev_close)):
-        return False, 0.0, 0.0, 0.0
+    opn, close, vol = num(cur["open"]), num(cur["close"]), num(cur["volume"])
+    prev_open, prev_close, prev_vol = num(prev["open"]), num(prev["close"]), num(prev["volume"])
+    if not all(math.isfinite(x) and x > 0 for x in (opn, close, vol, prev_open, prev_close, prev_vol)):
+        return False, 0.0, 0.0, 0.0, 0.0
     cur_body = close - opn
-    prev_body = body_size(prev)
-    body_pct = cur_body / opn
+    prev_body = abs(prev_close - prev_open)
     body_ratio = cur_body / max(prev_body, opn * 0.0005)
+    body_pct = cur_body / opn
+    vol_ratio = vol / prev_vol
     ret = close / prev_close - 1
-    ok = cur_body > 0 and cur_body > prev_body
-    return ok, body_ratio, body_pct, ret
+    ok = cur_body > 0 and cur_body > prev_body and vol > prev_vol
+    return ok, body_ratio, body_pct, vol_ratio, ret
+
+
+def structural_peak_quality(d: pd.DataFrame, idx: int, breakout_idx: int) -> tuple[bool, float, float, int, float]:
+    """判断被突破的前高是否足够明显，并返回峰前涨幅、峰后回调及前低。"""
+    if not local_peak(d, idx, 3) or breakout_idx - idx < 4:
+        return False, 0.0, 0.0, -1, math.nan
+    left = d.iloc[max(0, idx - 30):idx]
+    right = d.iloc[idx + 1:breakout_idx]
+    if len(left) < 8 or len(right) < 3:
+        return False, 0.0, 0.0, -1, math.nan
+    peak = num(d.iloc[idx]["high"])
+    left_low = num(left["low"].min())
+    trough_idx = int(right["low"].idxmin())
+    trough = num(d.iloc[trough_idx]["low"])
+    rise_before = peak / max(left_low, 1e-9) - 1
+    pullback = 1 - trough / max(peak, 1e-9)
+    ok = rise_before >= 0.05 and pullback >= 0.03
+    return ok, rise_before, pullback, trough_idx, trough
 
 
 def find_impulses(d: pd.DataFrame, confirm_idx: int) -> list[Impulse]:
-    """寻找近期在MA20/MA30之上、放量收盘突破明显前波峰的上涨段。"""
+    """近期必须存在：MA20之上、放量收盘突破明显前高的一段上涨。"""
     out: list[Impulse] = []
-    left_bound = max(65, confirm_idx - 105)
-    right_bound = confirm_idx - 2
+    left_bound = max(35, confirm_idx - 120)
+    right_bound = confirm_idx - 3
     if right_bound <= left_bound:
         return out
 
     for breakout_idx in range(left_bound, right_bound + 1):
         row = d.iloc[breakout_idx]
-        close, opn = num(row["close"]), num(row["open"])
-        ma20, ma30, vol = num(row["ma20"]), num(row["ma30"]), num(row["volume"])
-        prior_start = max(25, breakout_idx - 45)
-        prior = d.iloc[prior_start:breakout_idx]
-        if len(prior) < 20:
+        close, opn, ma20, vol = [num(row[c]) for c in ("close", "open", "ma20", "volume")]
+        if not all(math.isfinite(x) and x > 0 for x in (close, opn, ma20, vol)):
+            continue
+        if close <= ma20 or close <= opn:
             continue
 
-        prior_peak_idx = int(prior["high"].idxmax())
-        if breakout_idx - prior_peak_idx < 4 or not local_peak(d, prior_peak_idx, 2):
+        prior_slice = d.iloc[max(25, breakout_idx - 55):breakout_idx - 3]
+        if len(prior_slice) < 18:
             continue
-        prior_high = num(d.iloc[prior_peak_idx]["high"])
-        before_peak = d.iloc[max(0, prior_peak_idx - 25):prior_peak_idx]
-        after_peak = d.iloc[prior_peak_idx + 1:breakout_idx]
-        if len(before_peak) < 7 or len(after_peak) < 3:
+        peak_candidates = [
+            i for i in range(prior_slice.index.min(), prior_slice.index.max() + 1)
+            if local_peak(d, i, 3)
+        ]
+        peak_candidates.sort(reverse=True)
+        chosen = None
+        for prior_peak_idx in peak_candidates:
+            ok_peak, _, _, prior_trough_idx, prior_trough = structural_peak_quality(d, prior_peak_idx, breakout_idx)
+            if not ok_peak:
+                continue
+            prior_high = num(d.iloc[prior_peak_idx]["high"])
+            if close < prior_high * 1.002:
+                continue
+            chosen = (prior_peak_idx, prior_trough_idx, prior_high, prior_trough)
+            break
+        if chosen is None:
             continue
-        rise_before = prior_high / max(num(before_peak["low"].min()), 1e-9) - 1
-        prior_trough_idx = int(after_peak["low"].idxmin())
-        prior_trough = num(d.iloc[prior_trough_idx]["low"])
-        peak_pullback = 1 - prior_trough / max(prior_high, 1e-9)
-        if rise_before < 0.05 or peak_pullback < 0.035:
-            continue
+        prior_peak_idx, prior_trough_idx, prior_high, prior_trough = chosen
 
-        prior_vol = num(prior["volume"].median())
-        if not all(math.isfinite(x) and x > 0 for x in (close, opn, ma20, ma30, vol, prior_high, prior_vol)):
-            continue
-        vol_ratio = vol / prior_vol
+        base_vol = num(d.iloc[max(20, breakout_idx - 12):breakout_idx]["volume"].median())
         cluster = d.iloc[breakout_idx:min(confirm_idx, breakout_idx + 3)]
-        cluster_ratio = num(cluster["volume"].mean()) / prior_vol if len(cluster) else vol_ratio
-        if not (
-            close >= prior_high * 1.002
-            and close > opn
-            and close >= ma20
-            and close >= ma30
-            and max(vol_ratio, cluster_ratio) >= 1.15
-        ):
+        breakout_ratio = max(
+            vol / max(base_vol, 1e-9),
+            num(cluster["volume"].mean()) / max(base_vol, 1e-9) if len(cluster) else 0,
+        )
+        if not math.isfinite(base_vol) or base_vol <= 0 or breakout_ratio < 1.15:
             continue
 
-        peak_right = min(confirm_idx - 1, breakout_idx + 40)
+        peak_right = min(confirm_idx - 1, breakout_idx + 45)
         if peak_right <= breakout_idx:
             continue
         peak_idx = int(d.iloc[breakout_idx:peak_right + 1]["high"].idxmax())
         peak_high = num(d.iloc[peak_idx]["high"])
+        gain = peak_high / max(prior_trough, 1e-9) - 1
+        if gain < 0.08 or peak_high < prior_high * 1.025:
+            continue
+
+        impulse_bars = d.iloc[breakout_idx:peak_idx + 1]
+        if len(impulse_bars) < 3:
+            continue
+        above_ratio = float((impulse_bars["close"] >= impulse_bars["ma20"]).mean())
+        up_days = int((impulse_bars["close"] > impulse_bars["open"]).sum())
+        if above_ratio < 0.60 or up_days < 2:
+            continue
+        impulse_vol_median = num(impulse_bars["volume"].median())
+        impulse_vol_ratio = impulse_vol_median / max(base_vol, 1e-9)
         start_idx = prior_trough_idx
-        start_low = prior_trough
-        gain = peak_high / max(start_low, 1e-9) - 1
-        if gain < 0.10 or peak_high < prior_high * 1.025:
-            continue
-
-        segment = d.iloc[start_idx + 1:peak_idx + 1]
-        if len(segment) < 4:
-            continue
-        above = (segment["close"] >= segment["ma20"] * 0.995) & (segment["close"] >= segment["ma30"] * 0.995)
-        above_ratio = float(above.mean())
-        up_days = int((segment["close"] > segment["open"]).sum())
-        segment_volume_ratio = num(segment["volume"].median()) / prior_vol
-        if above_ratio < 0.60 or up_days < 3:
-            continue
-
         out.append(Impulse(
             start_idx=start_idx,
             breakout_idx=breakout_idx,
@@ -455,48 +483,66 @@ def find_impulses(d: pd.DataFrame, confirm_idx: int) -> list[Impulse]:
             prior_trough_idx=prior_trough_idx,
             prior_high=prior_high,
             prior_trough=prior_trough,
-            start_low=start_low,
+            start_low=prior_trough,
             peak_high=peak_high,
             gain=gain,
-            breakout_volume_ratio=max(vol_ratio, cluster_ratio),
-            segment_volume_ratio=segment_volume_ratio,
-            above_ma_ratio=above_ratio,
+            breakout_volume_ratio=breakout_ratio,
+            impulse_volume_ratio=impulse_vol_ratio,
+            above_ma20_ratio=above_ratio,
+            impulse_volume_median=impulse_vol_median,
         ))
 
     out.sort(key=lambda x: (x.peak_idx, x.gain, x.breakout_volume_ratio), reverse=True)
     unique: list[Impulse] = []
     for item in out:
-        if any(abs(item.peak_idx - old.peak_idx) <= 3 for old in unique):
+        if any(abs(item.peak_idx - old.peak_idx) <= 3 and abs(item.prior_peak_idx - old.prior_peak_idx) <= 5 for old in unique):
             continue
         unique.append(item)
-        if len(unique) >= 10:
+        if len(unique) >= 12:
             break
     return unique
 
 
-def find_historical_troughs(d: pd.DataFrame, end_idx: int, lookback: int = 260) -> list[StructuralLevel]:
-    """识别结构明显的历史回调波谷。"""
-    levels: list[StructuralLevel] = []
-    start = max(25, end_idx - lookback)
-    stop = min(end_idx - 3, len(d) - 5)
+def find_structural_troughs(d: pd.DataFrame, end_idx: int, lookback: int = 320) -> list[StructuralLevel]:
+    """识别结构明显的历史波谷：前有下跌、后有反弹，非单日噪声。"""
+    out: list[StructuralLevel] = []
+    start = max(20, end_idx - lookback)
+    stop = min(end_idx - 4, len(d) - 5)
     for i in range(start, stop + 1):
         if not local_low(d, i, 3):
             continue
         left = d.iloc[max(0, i - 30):i]
         right = d.iloc[i + 1:min(len(d), i + 31)]
-        if len(left) < 8 or len(right) < 5:
+        if len(left) < 8 or len(right) < 6:
             continue
         price = num(d.iloc[i]["low"])
         decline = 1 - price / max(num(left["high"].max()), 1e-9)
         rebound = num(right["high"].max()) / max(price, 1e-9) - 1
         if decline >= 0.05 and rebound >= 0.06:
-            levels.append(StructuralLevel(i, "历史波谷", price, decline, rebound))
-    levels.sort(key=lambda x: x.idx, reverse=True)
-    return levels
+            out.append(StructuralLevel(i, "历史波谷", price, decline, rebound, 1))
+    out.sort(key=lambda x: x.idx, reverse=True)
+    return out
 
 
-def horizontal_line_clear(d: pd.DataFrame, level: float, start_idx: int, end_idx: int) -> bool:
-    """水平支撑线可穿影线，但不能穿过中间K线实体。"""
+def count_support_validations(d: pd.DataFrame, level: float, start_idx: int, end_idx: int, tol: float = 0.03) -> int:
+    """统计支撑位被结构性低点验证的次数；相邻触点至少间隔5日。"""
+    hits: list[int] = []
+    for i in range(max(start_idx, 3), min(end_idx, len(d) - 4)):
+        if not local_low(d, i, 2):
+            continue
+        low = num(d.iloc[i]["low"])
+        if abs(low / max(level, 1e-9) - 1) > tol:
+            continue
+        future = d.iloc[i + 1:min(len(d), i + 10)]
+        if future.empty or num(future["high"].max()) / max(low, 1e-9) - 1 < 0.04:
+            continue
+        if not hits or i - hits[-1] >= 5:
+            hits.append(i)
+    return len(hits)
+
+
+def horizontal_support_clear(d: pd.DataFrame, level: float, start_idx: int, end_idx: int) -> bool:
+    """买点四：水平支撑线不可穿越实体，且形成后不得有收盘价跌破。"""
     if end_idx <= start_idx + 1:
         return True
     mid = d.iloc[start_idx + 1:end_idx]
@@ -504,32 +550,28 @@ def horizontal_line_clear(d: pd.DataFrame, level: float, start_idx: int, end_idx
         return True
     body_low = mid[["open", "close"]].min(axis=1)
     body_high = mid[["open", "close"]].max(axis=1)
-    crossed = (body_low < level * 0.999) & (body_high > level * 1.001)
-    # 若中间曾经实体收在支撑位下方，该水平位也不能继续作为未破坏支撑。
-    closed_below = mid["close"] < level
-    return not bool(crossed.any() or closed_below.any())
+    crosses_body = (body_low < level) & (body_high > level)
+    closes_below = mid["close"] < level
+    return not bool(crosses_body.any() or closes_below.any())
 
 
 def make_setup(
-    *, d: pd.DataFrame, impulse: Impulse, buy_point: int, state: str,
-    support_name: str, support_price: float, support_distance: float,
-    support_idx: int, touch_idx: int, confirm_idx: int, pullback_days: int,
-    drawdown: float, contraction: float, body_ratio: float, body_pct: float,
-    confirm_ret: float, broke_both: bool, amplitude: float, invalidation_margin: float,
+    *, d: pd.DataFrame, impulse: Impulse, buy_point: int, support_name: str,
+    support_price: float, support_distance: float, support_idx: int, touch_idx: int,
+    confirm_idx: int, pullback_days: int, drawdown: float, contraction: float,
+    body_ratio: float, body_pct: float, volume_ratio: float, confirm_ret: float,
+    broke_ma20: bool, validations: int = 1,
 ) -> BuySetup:
-    confirmed = state != "W"
-    label = {
-        1: "买点一·均线回踩确认",
-        2: "买点二·前波峰支撑确认",
-        3: "买点三·邻近波谷支撑确认",
+    labels = {
+        1: "买点一·MA20回踩确认",
+        2: "买点二·前高支撑确认",
+        3: "买点三·前低支撑确认",
         4: "买点四·历史波谷支撑确认",
-    }[buy_point]
-    if not confirmed:
-        label = f"等待确认·买点{buy_point}结构到位"
+    }
     return BuySetup(
-        state=state,
         buy_point=buy_point,
-        signal=label,
+        state=f"B{buy_point}",
+        signal=labels[buy_point],
         impulse=impulse,
         pullback_days=pullback_days,
         drawdown=drawdown,
@@ -537,16 +579,16 @@ def make_setup(
         support_name=support_name,
         support_price=support_price,
         support_distance=support_distance,
-        support_date=d.iloc[support_idx]["date"].strftime("%Y-%m-%d"),
+        support_idx=support_idx,
         touch_idx=touch_idx,
         confirmation_idx=confirm_idx,
-        confirmation_age=len(d) - 1 - confirm_idx,
         confirmation_body_ratio=body_ratio,
         confirmation_body_pct=body_pct,
+        confirmation_volume_ratio=volume_ratio,
         confirmation_return=confirm_ret,
-        broke_both_ma=broke_both,
-        structural_amplitude=amplitude,
-        invalidation_margin=invalidation_margin,
+        broke_ma20=broke_ma20,
+        support_validations=validations,
+        confirmation_above_ma20=num(d.iloc[confirm_idx]["close"]) >= num(d.iloc[confirm_idx]["ma20"]),
     )
 
 
@@ -555,180 +597,150 @@ def evaluate_setup_at(
     confirm_idx: int,
     ma_tolerance: float,
     structure_tolerance: float,
-    require_confirmation: bool,
+    max_contraction: float,
 ) -> tuple[BuySetup | None, str]:
-    """按买点一→二→三→四的优先级，只评估指定确认K线。"""
-    if require_confirmation:
-        ok, body_ratio, body_pct, confirm_ret = is_large_bullish_confirmation(d, confirm_idx)
-        if not ok:
-            return None, "当日非确认阳线"
-    else:
-        body_ratio = body_pct = confirm_ret = 0.0
+    """严格按买点一→二→三→四评估最新K线；不允许3日回看确认。"""
+    ok, body_ratio, body_pct, volume_ratio, confirm_ret = is_confirmation_candle(d, confirm_idx)
+    if not ok:
+        return None, "最新K线未同时满足阳线+实体放大+量能放大"
 
     impulses = find_impulses(d, confirm_idx)
     if not impulses:
-        return None, "无有效放量破峰上涨段"
+        return None, "近期无MA20上方放量破前高上涨段"
 
     best: BuySetup | None = None
     best_quality = -1e9
-    latest = d.iloc[confirm_idx]
-    latest_close = num(latest["close"])
-    latest_ma30 = num(latest["ma30"])
-
     for impulse in impulses:
         pullback_days = confirm_idx - impulse.peak_idx
-        if not 2 <= pullback_days <= 38:
+        if not 2 <= pullback_days <= 45:
             continue
         pull = d.iloc[impulse.peak_idx + 1:confirm_idx + 1]
-        pull_core = d.iloc[impulse.peak_idx + 1:confirm_idx] if require_confirmation else pull
-        impulse_bars = d.iloc[impulse.start_idx + 1:impulse.peak_idx + 1]
-        if len(pull_core) < 1 or len(impulse_bars) < 4:
+        pull_core = d.iloc[impulse.peak_idx + 1:confirm_idx]
+        if pull_core.empty:
             continue
 
         min_close_idx = int(pull["close"].idxmin())
         min_close = num(d.iloc[min_close_idx]["close"])
         drawdown = 1 - min_close / max(impulse.peak_high, 1e-9)
-        pull_speed = drawdown / max(pullback_days, 1)
-        if not 0.012 <= drawdown <= 0.55 or pull_speed > 0.055:
+        if drawdown < 0.01 or drawdown > 0.60:
             continue
 
-        impulse_vol = num(impulse_bars["volume"].median())
         pull_vol = num(pull_core["volume"].median())
-        contraction = pull_vol / max(impulse_vol, 1e-9)
-        if contraction > 1.00:
+        contraction = pull_vol / max(impulse.impulse_volume_median, 1e-9)
+        if not math.isfinite(contraction) or contraction > max_contraction:
             continue
 
-        # 买点一一旦收盘跌破MA30即失效；此后进入结构支撑买点判断。
-        broke_both = bool((pull["close"] < pull["ma30"]).any())
-        state = "W"
-        if require_confirmation:
-            state = "A"  # 后续按买点覆盖
+        broke_ma20 = bool((pull["close"] < pull["ma20"]).any())
+        latest = d.iloc[confirm_idx]
+        latest_close = num(latest["close"])
+        latest_ma20 = num(latest["ma20"])
         setup: BuySetup | None = None
 
-        # 买点一：最低收盘价距离当时MA20或MA30不超过15%，且回调期间不能收盘跌破MA30。
-        min_row = d.iloc[min_close_idx]
-        ma_candidates: list[tuple[str, float, float]] = []
-        for name, col in (("MA20", "ma20"), ("MA30", "ma30")):
-            level = num(min_row[col])
-            if math.isfinite(level) and level > 0:
-                ma_candidates.append((name, level, abs(min_close / level - 1)))
-        if ma_candidates:
-            ma_name, ma_level_at_low, ma_dist = min(ma_candidates, key=lambda x: x[2])
-            pull_valid_ma30 = bool((pull["close"] >= pull["ma30"]).all())
-            if ma_dist <= ma_tolerance and pull_valid_ma30 and latest_close >= latest_ma30:
-                setup = make_setup(
-                    d=d, impulse=impulse, buy_point=1,
-                    state="A" if require_confirmation else "W",
-                    support_name=ma_name, support_price=ma_level_at_low,
-                    support_distance=ma_dist, support_idx=min_close_idx, touch_idx=min_close_idx,
-                    confirm_idx=confirm_idx, pullback_days=pullback_days, drawdown=drawdown,
-                    contraction=contraction, body_ratio=body_ratio, body_pct=body_pct,
-                    confirm_ret=confirm_ret, broke_both=broke_both, amplitude=0.0,
-                    invalidation_margin=0.0,
-                )
+        # 买点一：整个回调收盘不能跌破MA20；最低收盘距离当时MA20不超10%。
+        min_ma20 = num(d.iloc[min_close_idx]["ma20"])
+        ma_dist = abs(min_close / max(min_ma20, 1e-9) - 1) if min_ma20 > 0 else math.inf
+        if not broke_ma20 and latest_close >= latest_ma20 and ma_dist <= ma_tolerance:
+            setup = make_setup(
+                d=d, impulse=impulse, buy_point=1, support_name="MA20",
+                support_price=min_ma20, support_distance=ma_dist,
+                support_idx=min_close_idx, touch_idx=min_close_idx, confirm_idx=confirm_idx,
+                pullback_days=pullback_days, drawdown=drawdown, contraction=contraction,
+                body_ratio=body_ratio, body_pct=body_pct, volume_ratio=volume_ratio,
+                confirm_ret=confirm_ret, broke_ma20=False,
+            )
 
-        # 买点二：跌破双均线后，回踩本轮突破所对应的前波峰，最低收盘偏差≤5%。
-        if setup is None and broke_both:
+        # 买点二：已跌破MA20，继续回踩本轮上涨突破的前高；支撑偏差≤5%。
+        if setup is None and broke_ma20:
             level = impulse.prior_high
-            dist = abs(min_close / level - 1)
-            if dist <= structure_tolerance and latest_close >= level * (1 - structure_tolerance):
+            dist = abs(min_close / max(level, 1e-9) - 1)
+            if dist <= structure_tolerance and latest_close >= level * 0.95:
                 setup = make_setup(
-                    d=d, impulse=impulse, buy_point=2,
-                    state="B" if require_confirmation else "W",
-                    support_name="前波峰", support_price=level, support_distance=dist,
-                    support_idx=impulse.prior_peak_idx, touch_idx=min_close_idx,
-                    confirm_idx=confirm_idx, pullback_days=pullback_days, drawdown=drawdown,
-                    contraction=contraction, body_ratio=body_ratio, body_pct=body_pct,
-                    confirm_ret=confirm_ret, broke_both=True,
-                    amplitude=impulse.gain, invalidation_margin=structure_tolerance,
+                    d=d, impulse=impulse, buy_point=2, support_name="邻近前高",
+                    support_price=level, support_distance=dist,
+                    support_idx=impulse.prior_peak_idx, touch_idx=min_close_idx, confirm_idx=confirm_idx,
+                    pullback_days=pullback_days, drawdown=drawdown, contraction=contraction,
+                    body_ratio=body_ratio, body_pct=body_pct, volume_ratio=volume_ratio,
+                    confirm_ret=confirm_ret, broke_ma20=True,
                 )
 
-        # 买点三：跌破双均线后，回踩邻近上一波回调波谷，最低收盘偏差≤5%。
-        if setup is None and broke_both:
+        # 买点三：已跌破MA20，继续回踩邻近上一波回调前低；偏差≤5%。
+        if setup is None and broke_ma20:
             level = impulse.prior_trough
-            dist = abs(min_close / level - 1)
-            if dist <= structure_tolerance and latest_close >= level * (1 - structure_tolerance):
+            dist = abs(min_close / max(level, 1e-9) - 1)
+            if dist <= structure_tolerance and latest_close >= level * 0.95:
                 setup = make_setup(
-                    d=d, impulse=impulse, buy_point=3,
-                    state="C" if require_confirmation else "W",
-                    support_name="邻近前波谷", support_price=level, support_distance=dist,
-                    support_idx=impulse.prior_trough_idx, touch_idx=min_close_idx,
-                    confirm_idx=confirm_idx, pullback_days=pullback_days, drawdown=drawdown,
-                    contraction=contraction, body_ratio=body_ratio, body_pct=body_pct,
-                    confirm_ret=confirm_ret, broke_both=True,
-                    amplitude=impulse.gain, invalidation_margin=structure_tolerance,
+                    d=d, impulse=impulse, buy_point=3, support_name="邻近前低",
+                    support_price=level, support_distance=dist,
+                    support_idx=impulse.prior_trough_idx, touch_idx=min_close_idx, confirm_idx=confirm_idx,
+                    pullback_days=pullback_days, drawdown=drawdown, contraction=contraction,
+                    body_ratio=body_ratio, body_pct=body_pct, volume_ratio=volume_ratio,
+                    confirm_ret=confirm_ret, broke_ma20=True,
                 )
 
-        # 买点四：邻近波谷已跌破后，只沿时间向前寻找越来越低的历史波谷；
-        # 水平线不得穿越中间实体，确认收盘不得低于支撑位。
-        if setup is None and broke_both and min_close < impulse.prior_trough:
-            troughs = find_historical_troughs(d, impulse.prior_peak_idx)
+        # 买点四：邻近前低已失效后，逐级向前找更低历史波谷；至少两次验证，水平线不穿实体。
+        if setup is None and broke_ma20 and min_close < impulse.prior_trough * 0.95:
+            troughs = find_structural_troughs(d, impulse.prior_trough_idx)
             lower_chain: list[StructuralLevel] = []
             ceiling = impulse.prior_trough
-            for level_obj in troughs:
-                if level_obj.price < ceiling * 0.995:
-                    lower_chain.append(level_obj)
-                    ceiling = level_obj.price
-            for level_obj in lower_chain:
-                dist = abs(min_close / level_obj.price - 1)
+            for lv in troughs:
+                if lv.price < ceiling * 0.995:
+                    lower_chain.append(lv)
+                    ceiling = lv.price
+            for lv in lower_chain:
+                dist = abs(min_close / max(lv.price, 1e-9) - 1)
                 if dist > structure_tolerance:
                     continue
-                if latest_close < level_obj.price:
+                if latest_close < lv.price:  # 买点四收盘跌破支撑即失效
                     continue
-                if not horizontal_line_clear(d, level_obj.price, level_obj.idx, min_close_idx):
+                validations = count_support_validations(d, lv.price, lv.idx, min_close_idx + 1, tol=0.03)
+                if validations < 2:
+                    continue
+                if not horizontal_support_clear(d, lv.price, lv.idx, min_close_idx):
                     continue
                 setup = make_setup(
-                    d=d, impulse=impulse, buy_point=4,
-                    state="D" if require_confirmation else "W",
-                    support_name="历史更低波谷", support_price=level_obj.price,
-                    support_distance=dist, support_idx=level_obj.idx, touch_idx=min_close_idx,
-                    confirm_idx=confirm_idx, pullback_days=pullback_days, drawdown=drawdown,
-                    contraction=contraction, body_ratio=body_ratio, body_pct=body_pct,
-                    confirm_ret=confirm_ret, broke_both=True,
-                    amplitude=min(level_obj.move_before, level_obj.move_after),
-                    invalidation_margin=0.0,
+                    d=d, impulse=impulse, buy_point=4, support_name="历史波谷",
+                    support_price=lv.price, support_distance=dist,
+                    support_idx=lv.idx, touch_idx=min_close_idx, confirm_idx=confirm_idx,
+                    pullback_days=pullback_days, drawdown=drawdown, contraction=contraction,
+                    body_ratio=body_ratio, body_pct=body_pct, volume_ratio=volume_ratio,
+                    confirm_ret=confirm_ret, broke_ma20=True, validations=validations,
                 )
                 break
 
         if setup is None:
             continue
+
         tol = ma_tolerance if setup.buy_point == 1 else structure_tolerance
         proximity = 1 - min(setup.support_distance / max(tol, 1e-9), 1)
         quality = (
-            min(impulse.gain, 0.65) * 42
-            + min(impulse.breakout_volume_ratio, 3.0) * 7
-            + impulse.above_ma_ratio * 14
-            + max(0, 1 - contraction) * 25
-            + proximity * 18
-            + min(body_ratio, 4.0) * 5
-            + {1: 8, 2: 7, 3: 6, 4: 5}[setup.buy_point]
-            + min(setup.structural_amplitude, 0.25) * 16
+            clamp((impulse.gain - 0.08) / 0.45, 0, 1) * 22
+            + clamp((impulse.breakout_volume_ratio - 1.15) / 1.85, 0, 1) * 15
+            + clamp((impulse.above_ma20_ratio - 0.60) / 0.40, 0, 1) * 10
+            + clamp((max_contraction - contraction) / max(max_contraction - 0.30, 0.01), 0, 1) * 20
+            + proximity * 15
+            + clamp((body_ratio - 1.0) / 2.5, 0, 1) * 8
+            + clamp((volume_ratio - 1.0) / 1.5, 0, 1) * 6
+            + {1: 8, 2: 6, 3: 4, 4: 2}[setup.buy_point]
+            + (4 if setup.buy_point == 2 and setup.confirmation_above_ma20 else 0)
         )
         if quality > best_quality:
             best_quality = quality
             best = setup
 
     if best is not None:
-        return best, "已确认" if require_confirmation else f"等待买点{best.buy_point}确认"
-    return None, "回调未到有效支撑或已失效"
+        return best, "已确认"
+    return None, "有上涨段，但回调尚未同时满足缩量、支撑和失效规则"
 
 
 def find_buy_setup(
     d: pd.DataFrame,
-    ma_tolerance: float = 0.15,
+    ma_tolerance: float = 0.10,
     structure_tolerance: float = 0.05,
+    max_contraction: float = 0.85,
 ) -> tuple[BuySetup | None, str]:
-    """V4.4只认最新K线确认；按四买点优先级识别。"""
-    if len(d) < 110:
+    if len(d) < 120:
         return None, "数据不足"
-    latest_idx = len(d) - 1
-    setup, stage = evaluate_setup_at(d, latest_idx, ma_tolerance, structure_tolerance, True)
-    if setup is not None:
-        return setup, "已确认"
-    waiting, waiting_stage = evaluate_setup_at(d, latest_idx, ma_tolerance, structure_tolerance, False)
-    if waiting is not None:
-        return waiting, waiting_stage
-    return None, stage
+    return evaluate_setup_at(d, len(d) - 1, ma_tolerance, structure_tolerance, max_contraction)
 
 
 def analyze_stock(
@@ -742,62 +754,59 @@ def analyze_stock(
     spot_row: pd.Series,
     tolerance: float,
     structure_tolerance: float,
+    max_contraction: float,
 ) -> tuple[dict[str, Any] | None, str]:
     del market_r20, breadth
     d = add_indicators(d0)
-    if len(d) < 110:
+    if len(d) < 120:
         return None, "数据不足"
-    setup, stage = find_buy_setup(d, ma_tolerance=tolerance, structure_tolerance=structure_tolerance)
+    setup, stage = find_buy_setup(d, tolerance, structure_tolerance, max_contraction)
     if setup is None:
         return None, stage
 
     last = d.iloc[-1]
-    price = num(last["close"])
-    ma20, ma30 = num(last["ma20"]), num(last["ma30"])
-    dist20 = price / ma20 - 1 if ma20 > 0 else math.nan
-    dist30 = price / ma30 - 1 if ma30 > 0 else math.nan
+    price, ma20 = num(last["close"]), num(last["ma20"])
     impulse = setup.impulse
-    max_tol = tolerance if setup.buy_point == 1 else structure_tolerance
-    proximity_score = 1 - min(setup.support_distance / max(max_tol, 1e-9), 1)
-    state_bonus = {"A": 8, "B": 7, "C": 6, "D": 5, "W": 0}.get(setup.state, 0)
+
+    # 最后一道硬失效校验，确保网页不出现违反用户规则的候选。
+    if setup.buy_point == 1 and price < ma20:
+        return None, "买点一失效·最新收盘跌破MA20"
+    if setup.buy_point in {2, 3} and price < setup.support_price * 0.95:
+        return None, f"买点{setup.buy_point}失效·收盘跌破支撑5%"
+    if setup.buy_point == 4 and price < setup.support_price:
+        return None, "买点四失效·收盘跌破历史波谷"
+
+    tol = tolerance if setup.buy_point == 1 else structure_tolerance
+    proximity = 1 - min(setup.support_distance / max(tol, 1e-9), 1)
     score = (
-        clamp((impulse.gain - 0.08) / 0.47, 0, 1) * 23
-        + clamp((impulse.breakout_volume_ratio - 1.05) / 1.95, 0, 1) * 17
-        + clamp((impulse.above_ma_ratio - 0.50) / 0.50, 0, 1) * 10
-        + clamp((1.00 - setup.contraction) / 0.65, 0, 1) * 22
-        + proximity_score * 16
+        clamp((impulse.gain - 0.08) / 0.45, 0, 1) * 24
+        + clamp((impulse.breakout_volume_ratio - 1.15) / 1.85, 0, 1) * 16
+        + clamp((1 - setup.contraction) / 0.70, 0, 1) * 22
+        + proximity * 16
         + clamp((setup.confirmation_body_ratio - 1.0) / 2.5, 0, 1) * 9
-        + state_bonus
-        - (8 if setup.state == "W" else 0)
+        + clamp((setup.confirmation_volume_ratio - 1.0) / 1.5, 0, 1) * 7
+        + {1: 8, 2: 6, 3: 4, 4: 2}[setup.buy_point]
+        + (4 if setup.buy_point == 2 and setup.confirmation_above_ma20 else 0)
     )
     score = clamp(score, 0, 100)
 
     confirm_row = d.iloc[setup.confirmation_idx]
-    # 再做一次硬失效校验，防止页面出现与规则相反的候选。
-    if setup.buy_point == 1 and price < ma30:
-        return None, "买点一失效·确认收盘跌破MA30"
-    if setup.buy_point in {2, 3} and price < setup.support_price * (1 - structure_tolerance):
-        return None, f"买点{setup.buy_point}失效·收盘跌破支撑5%"
-    if setup.buy_point == 4 and price < setup.support_price:
-        return None, "买点四失效·收盘跌破历史波谷支撑"
-
     trigger = num(confirm_row["high"]) * 1.002
     if setup.buy_point == 1:
-        stop = ma30
-        invalidation_rule = "收盘价跌破MA30"
+        stop = ma20
+        invalidation_rule = "收盘价跌破MA20"
     elif setup.buy_point in {2, 3}:
-        stop = setup.support_price * (1 - structure_tolerance)
-        invalidation_rule = f"收盘价跌破{setup.support_name}支撑5%"
+        stop = setup.support_price * 0.95
+        invalidation_rule = f"收盘价跌破{setup.support_name}5%"
     else:
         stop = setup.support_price
-        invalidation_rule = "收盘价跌破历史波谷支撑位"
+        invalidation_rule = "收盘价跌破历史波谷支撑"
     if stop <= 0 or stop >= trigger:
         return None, "失效线不低于触发价"
     risk_pct = (trigger - stop) / trigger
     target = trigger + 2 * (trigger - stop)
-
     change_pct = num(spot_row.get("change_pct"))
-    pull_speed = setup.drawdown / max(setup.pullback_days, 1)
+
     return {
         "code": code,
         "name": name,
@@ -810,9 +819,7 @@ def analyze_stock(
         "price": round(price, 3),
         "change_pct": safe_round(change_pct, 2),
         "ma20": round(ma20, 3),
-        "ma30": round(ma30, 3),
-        "distance_ma20_pct": pct(dist20),
-        "distance_ma30_pct": pct(dist30),
+        "distance_ma20_pct": pct(price / ma20 - 1) if ma20 > 0 else None,
         "impulse_start_date": d.iloc[impulse.start_idx]["date"].strftime("%Y-%m-%d"),
         "prior_peak_date": d.iloc[impulse.prior_peak_idx]["date"].strftime("%Y-%m-%d"),
         "prior_peak_price": round(impulse.prior_high, 3),
@@ -822,22 +829,21 @@ def analyze_stock(
         "impulse_peak_date": d.iloc[impulse.peak_idx]["date"].strftime("%Y-%m-%d"),
         "impulse_gain_pct": pct(impulse.gain),
         "breakout_volume_ratio": round(impulse.breakout_volume_ratio, 2),
-        "impulse_volume_ratio": round(impulse.segment_volume_ratio, 2),
-        "above_ma_ratio_pct": pct(impulse.above_ma_ratio),
+        "above_ma20_ratio_pct": pct(impulse.above_ma20_ratio),
         "pullback_days": setup.pullback_days,
         "drawdown_pct": pct(setup.drawdown),
-        "pullback_speed_pct_day": pct(pull_speed),
         "pullback_volume_ratio": round(setup.contraction, 2),
         "support_name": setup.support_name,
         "support_price": round(setup.support_price, 3),
-        "support_date": setup.support_date,
+        "support_date": d.iloc[setup.support_idx]["date"].strftime("%Y-%m-%d"),
         "support_distance_pct": pct(setup.support_distance),
+        "support_validations": setup.support_validations,
         "confirmation_date": confirm_row["date"].strftime("%Y-%m-%d"),
-        "confirmation_age_days": setup.confirmation_age,
         "confirmation_body_ratio": round(setup.confirmation_body_ratio, 2),
         "confirmation_body_pct": pct(setup.confirmation_body_pct),
+        "confirmation_volume_ratio": round(setup.confirmation_volume_ratio, 2),
         "confirmation_return_pct": pct(setup.confirmation_return),
-        "broke_both_ma": setup.broke_both_ma,
+        "confirmation_above_ma20": setup.confirmation_above_ma20,
         "trigger": round(trigger, 3),
         "stop": round(stop, 3),
         "target_2r": round(target, 3),
@@ -848,29 +854,13 @@ def analyze_stock(
         "amount_yi": safe_round(num(spot_row.get("amount")) / 1e8, 2),
         "turnover": safe_round(spot_row.get("turnover"), 2),
         "volume_ratio_spot": safe_round(spot_row.get("volume_ratio"), 2),
+        "chart_url": "",
         "reason": [
-            (
-                f"{d.iloc[impulse.breakout_idx]['date']:%Y-%m-%d} 收盘放量突破前波峰 "
-                f"{impulse.prior_high:.2f}，突破量为前期中位量的 {impulse.breakout_volume_ratio:.2f} 倍"
-            ),
-            (
-                f"上涨段涨幅 {pct(impulse.gain):.1f}%，"
-                f"{pct(impulse.above_ma_ratio):.1f}% 的交易日收在MA20与MA30之上"
-            ),
-            (
-                f"随后回调 {setup.pullback_days} 日、回撤 {pct(setup.drawdown):.1f}%，"
-                f"回调中位量缩至上涨段的 {setup.contraction:.2f}"
-            ),
-            (
-                f"回调最低收盘价靠近 {setup.support_name} {setup.support_price:.2f}，"
-                f"偏差 {pct(setup.support_distance):.1f}%"
-            ),
-            (
-                f"确认日 {confirm_row['date']:%Y-%m-%d} 收阳，实体为上一根K线实体的 "
-                f"{setup.confirmation_body_ratio:.2f} 倍"
-                if setup.state != "W"
-                else f"买点{setup.buy_point}结构已经到位，最新K线尚未完成放大实体阳线确认"
-            ),
+            f"{d.iloc[impulse.breakout_idx]['date']:%Y-%m-%d} 在MA20上方放量突破明显前高 {impulse.prior_high:.2f}，突破量比 {impulse.breakout_volume_ratio:.2f}",
+            f"突破后上涨段最大涨幅 {pct(impulse.gain):.1f}%，MA20上方收盘占比 {pct(impulse.above_ma20_ratio):.1f}%",
+            f"随后回调 {setup.pullback_days} 日，回撤 {pct(setup.drawdown):.1f}%，回调中位量缩至上涨段的 {setup.contraction:.2f}",
+            f"回调最低收盘价距离 {setup.support_name} {setup.support_price:.2f} 为 {pct(setup.support_distance):.1f}%",
+            f"确认日收阳，实体为上一根 {setup.confirmation_body_ratio:.2f} 倍，成交量为上一根 {setup.confirmation_volume_ratio:.2f} 倍",
             f"触发 {trigger:.2f} / 失效线 {stop:.2f}（{invalidation_rule}）/ 2R参考 {target:.2f}",
         ],
     }, stage
@@ -931,19 +921,134 @@ def choose_universe(spot: pd.DataFrame, args: argparse.Namespace) -> pd.DataFram
     return d.reset_index(drop=True)
 
 
+
+def svg_escape(s: Any) -> str:
+    return (
+        str(s).replace("&", "&amp;").replace("<", "&lt;")
+        .replace(">", "&gt;").replace('"', "&quot;")
+    )
+
+
+def render_candidate_chart(d0: pd.DataFrame, item: dict[str, Any], out_path: Path, bars: int = 120) -> None:
+    """生成不依赖matplotlib的轻量SVG日K图：K线 + MA20 + 支撑 + 成交量。"""
+    d = add_indicators(d0).copy().reset_index(drop=True)
+    if d.empty:
+        return
+    # 从上涨段前约10日开始展示，同时限制最大K线数量。
+    dates = pd.to_datetime(d["date"], errors="coerce")
+    start_date = pd.to_datetime(item.get("impulse_start_date"), errors="coerce")
+    start_idx = 0
+    if pd.notna(start_date):
+        idxs = d.index[dates >= start_date]
+        if len(idxs):
+            start_idx = max(0, int(idxs[0]) - 10)
+    start_idx = max(start_idx, len(d) - bars)
+    v = d.iloc[start_idx:].copy().reset_index(drop=True)
+    if len(v) < 10:
+        return
+
+    width, height = 960, 560
+    left, right, top = 64, 24, 46
+    price_h, gap, vol_h = 350, 24, 90
+    vol_top = top + price_h + gap
+    plot_w = width - left - right
+    highs = pd.to_numeric(v["high"], errors="coerce")
+    lows = pd.to_numeric(v["low"], errors="coerce")
+    support = num(item.get("support_price"))
+    ymin = min(num(lows.min()), support if support > 0 else num(lows.min()))
+    ymax = max(num(highs.max()), support if support > 0 else num(highs.max()))
+    pad = max((ymax - ymin) * 0.08, ymax * 0.01)
+    ymin, ymax = ymin - pad, ymax + pad
+    step = plot_w / max(len(v), 1)
+    candle_w = max(2.0, min(7.0, step * 0.58))
+
+    def x(i: int) -> float:
+        return left + (i + 0.5) * step
+
+    def y(price: float) -> float:
+        return top + (ymax - price) / max(ymax - ymin, 1e-9) * price_h
+
+    max_vol = max(num(v["volume"].max()), 1.0)
+    def vy(vol: float) -> float:
+        return vol_top + vol_h - vol / max_vol * vol_h
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="{left}" y="26" font-size="18" font-weight="700" fill="#1c2738">{svg_escape(item.get("name"))} {svg_escape(item.get("code"))} · {svg_escape(item.get("signal"))}</text>',
+        f'<text x="{width-right}" y="26" text-anchor="end" font-size="13" fill="#6f7b8f">确认 {svg_escape(item.get("confirmation_date"))}</text>',
+    ]
+    # 网格与价格标签
+    for k in range(5):
+        py = top + price_h * k / 4
+        price = ymax - (ymax - ymin) * k / 4
+        parts.append(f'<line x1="{left}" y1="{py:.1f}" x2="{width-right}" y2="{py:.1f}" stroke="#edf0f5"/>')
+        parts.append(f'<text x="{left-8}" y="{py+4:.1f}" text-anchor="end" font-size="11" fill="#8a94a6">{price:.2f}</text>')
+
+    # 支撑线
+    if support > 0 and ymin <= support <= ymax:
+        sy = y(support)
+        parts.append(f'<line x1="{left}" y1="{sy:.1f}" x2="{width-right}" y2="{sy:.1f}" stroke="#2f6fed" stroke-width="2" stroke-dasharray="8 5"/>')
+        parts.append(f'<text x="{width-right-4}" y="{sy-6:.1f}" text-anchor="end" font-size="12" fill="#2f6fed">{svg_escape(item.get("support_name"))} {support:.2f}</text>')
+
+    # K线
+    for i, row in v.iterrows():
+        opn, close, high, low, vol = [num(row[c]) for c in ("open", "close", "high", "low", "volume")]
+        if not all(math.isfinite(z) for z in (opn, close, high, low, vol)):
+            continue
+        color = "#d84a3a" if close >= opn else "#168a50"
+        xi = x(i)
+        parts.append(f'<line x1="{xi:.1f}" y1="{y(high):.1f}" x2="{xi:.1f}" y2="{y(low):.1f}" stroke="{color}" stroke-width="1.2"/>')
+        y1, y2 = y(max(opn, close)), y(min(opn, close))
+        h = max(1.4, y2-y1)
+        fill = "#ffffff" if close >= opn else color
+        parts.append(f'<rect x="{xi-candle_w/2:.1f}" y="{y1:.1f}" width="{candle_w:.1f}" height="{h:.1f}" fill="{fill}" stroke="{color}" stroke-width="1.2"/>')
+        vtop = vy(vol)
+        parts.append(f'<rect x="{xi-candle_w/2:.1f}" y="{vtop:.1f}" width="{candle_w:.1f}" height="{vol_top+vol_h-vtop:.1f}" fill="{color}" opacity="0.75"/>')
+
+    # MA20
+    pts = []
+    for i, val in enumerate(v["ma20"]):
+        m = num(val)
+        if math.isfinite(m) and ymin <= m <= ymax:
+            pts.append(f"{x(i):.1f},{y(m):.1f}")
+    if pts:
+        parts.append(f'<polyline points="{" ".join(pts)}" fill="none" stroke="#7b3ff2" stroke-width="2.2"/>')
+        parts.append(f'<text x="{left+8}" y="{top+18}" font-size="12" fill="#7b3ff2">MA20</text>')
+
+    # 确认K线标记
+    confirm_date = pd.to_datetime(item.get("confirmation_date"), errors="coerce")
+    if pd.notna(confirm_date):
+        hits = v.index[pd.to_datetime(v["date"]).dt.normalize() == confirm_date.normalize()]
+        if len(hits):
+            ci = int(hits[-1]); cx = x(ci)
+            parts.append(f'<line x1="{cx:.1f}" y1="{top}" x2="{cx:.1f}" y2="{vol_top+vol_h}" stroke="#f0a000" stroke-width="1.6" stroke-dasharray="5 4"/>')
+            parts.append(f'<text x="{cx-5:.1f}" y="{top+16}" text-anchor="end" font-size="12" fill="#b66d00">确认K</text>')
+
+    # 日期轴
+    for frac in (0.0, 0.5, 1.0):
+        i = min(len(v)-1, max(0, int(round((len(v)-1)*frac))))
+        dt = pd.to_datetime(v.iloc[i]["date"], errors="coerce")
+        label = dt.strftime("%Y-%m-%d") if pd.notna(dt) else ""
+        parts.append(f'<text x="{x(i):.1f}" y="{height-16}" text-anchor="middle" font-size="11" fill="#8a94a6">{label}</text>')
+    parts.append(f'<line x1="{left}" y1="{vol_top+vol_h}" x2="{width-right}" y2="{vol_top+vol_h}" stroke="#dfe4ec"/>')
+    parts.append('</svg>')
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text("".join(parts), encoding="utf-8")
+
+
 def write_outputs(payload: dict[str, Any]) -> None:
     (DATA_DIR / "latest.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     fields = [
         "state", "buy_point", "signal", "score", "code", "name", "industry", "price", "change_pct",
-        "impulse_start_date", "prior_peak_date", "prior_peak_price", "prior_trough_date", "prior_trough_price", "breakout_date", "impulse_peak_date", "impulse_gain_pct",
-        "breakout_volume_ratio", "impulse_volume_ratio", "above_ma_ratio_pct",
-        "pullback_days", "drawdown_pct", "pullback_speed_pct_day", "pullback_volume_ratio",
-        "support_name", "support_price", "support_date", "support_distance_pct",
-        "confirmation_date", "confirmation_age_days", "confirmation_body_ratio", "confirmation_body_pct", "confirmation_return_pct",
-        "distance_ma20_pct", "distance_ma30_pct", "trigger", "stop", "target_2r",
-        "risk_pct", "risk_reward", "amount_yi", "turnover",
+        "prior_peak_date", "prior_peak_price", "prior_trough_date", "prior_trough_price",
+        "breakout_date", "impulse_peak_date", "impulse_gain_pct", "breakout_volume_ratio", "above_ma20_ratio_pct",
+        "pullback_days", "drawdown_pct", "pullback_volume_ratio", "support_name", "support_price", "support_date",
+        "support_distance_pct", "support_validations", "confirmation_date", "confirmation_body_ratio",
+        "confirmation_volume_ratio", "confirmation_above_ma20", "distance_ma20_pct", "trigger", "stop", "target_2r",
+        "risk_pct", "risk_reward", "amount_yi", "turnover", "chart_url",
     ]
     with (DATA_DIR / "candidates.csv").open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
@@ -956,19 +1061,20 @@ def main() -> int:
     ap.add_argument("--mode", choices=["intraday", "close"], default="close")
     ap.add_argument("--max-price", type=float, default=10000.0)
     ap.add_argument("--min-price", type=float, default=0.5)
-    ap.add_argument("--min-amount-yi", type=float, default=0.0, help="当日最低成交额，亿元")
-    ap.add_argument("--max-stocks", type=int, default=0, help="0=全部")
+    ap.add_argument("--min-amount-yi", type=float, default=0.0)
+    ap.add_argument("--max-stocks", type=int, default=0, help="0=沪深主板全部")
     ap.add_argument("--workers", type=int, default=28)
-    ap.add_argument("--bars", type=int, default=320)
-    ap.add_argument("--top", type=int, default=52)
-    ap.add_argument("--near-tolerance", type=float, default=0.15, help="买点一均线附近偏差，0.15=15%")
-    ap.add_argument("--structure-tolerance", type=float, default=0.05, help="买点二/三/四结构支撑偏差，0.05=5%")
+    ap.add_argument("--bars", type=int, default=360)
+    ap.add_argument("--top", type=int, default=56)
+    ap.add_argument("--near-tolerance", type=float, default=0.10, help="买点一最低收盘距离MA20最大偏差")
+    ap.add_argument("--structure-tolerance", type=float, default=0.05, help="买点二/三/四支撑最大偏差")
+    ap.add_argument("--max-contraction", type=float, default=0.85, help="回调中位量/上涨段中位量上限")
     args = ap.parse_args()
 
     started = time.time()
     now = datetime.now(SH_TZ)
     warnings: list[str] = []
-    print(f"[{now:%F %T}] 开始四买点结构扫描：{args.mode}")
+    print(f"[{now:%F %T}] 开始四买点结构扫描 V5.0：{args.mode}")
     spot, source, src_warnings = get_spot()
     warnings.extend(src_warnings)
     universe = choose_universe(spot, args)
@@ -989,7 +1095,7 @@ def main() -> int:
         for fut in cf.as_completed(futs):
             code, hist, note = fut.result()
             done += 1
-            if hist is not None and len(hist) >= 110:
+            if hist is not None and len(hist) >= 120:
                 histories[code] = merge_spot_bar(hist, rows_by_code[code], now)
                 if note:
                     fallback_count += 1
@@ -1025,7 +1131,8 @@ def main() -> int:
         try:
             item, stage = analyze_stock(
                 code, str(r["name"]), industry, industry_score, h,
-                market_r20, breadth, r, args.near_tolerance, args.structure_tolerance,
+                market_r20, breadth, r, args.near_tolerance,
+                args.structure_tolerance, args.max_contraction,
             )
             stage_counts[stage] += 1
             if item:
@@ -1035,29 +1142,45 @@ def main() -> int:
             if len(warnings) < 12:
                 warnings.append(f"{code} 计算异常：{type(exc).__name__}")
 
-    state_rank = {"A": 0, "B": 1, "C": 2, "D": 3, "W": 4}
-    candidates.sort(
-        key=lambda x: (
-            state_rank.get(x["state"], 9),
-            -x["score"],
-            x.get("support_distance_pct", 99),
-            x.get("pullback_volume_ratio", 99),
-            -num(x.get("amount_yi"), 0),
-        )
-    )
-    caps = {"A": 16, "B": 10, "C": 10, "D": 6, "W": 10}
+    state_rank = {"B1": 0, "B2": 1, "B3": 2, "B4": 3}
+    candidates.sort(key=lambda x: (
+        state_rank.get(x["state"], 9),
+        -x["score"],
+        x.get("support_distance_pct", 99),
+        x.get("pullback_volume_ratio", 99),
+        -num(x.get("amount_yi"), 0),
+    ))
+    caps = {"B1": 20, "B2": 16, "B3": 12, "B4": 8}
     selected: list[dict[str, Any]] = []
-    counts = {"A": 0, "B": 0, "C": 0, "D": 0, "W": 0}
+    counts = {"B1": 0, "B2": 0, "B3": 0, "B4": 0}
     for item in candidates:
-        state = item["state"]
-        if counts.get(state, 0) < caps.get(state, 0) and len(selected) < args.top:
+        s = item["state"]
+        if counts.get(s, 0) < caps.get(s, 0) and len(selected) < args.top:
             selected.append(item)
-            counts[state] += 1
+            counts[s] += 1
+
+    # 每次扫描只保留本次候选图表，避免旧图混淆。
+    chart_dir = DATA_DIR / "charts"
+    chart_dir.mkdir(exist_ok=True)
+    for old in chart_dir.glob("*.svg"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    for item in selected:
+        code = item["code"]
+        chart_name = f"{code}.svg"
+        try:
+            render_candidate_chart(histories[code], item, chart_dir / chart_name)
+            item["chart_url"] = f"data/charts/{chart_name}"
+        except Exception as exc:  # noqa: BLE001
+            if len(warnings) < 18:
+                warnings.append(f"{code} K线图生成失败：{type(exc).__name__}")
 
     generated = datetime.now(SH_TZ)
     payload = {
-        "schema": 9,
-        "strategy_version": "V4.4",
+        "schema": 10,
+        "strategy_version": "V5.0",
         "meta": {
             "status": "success",
             "mode": args.mode,
@@ -1073,35 +1196,24 @@ def main() -> int:
             "elapsed_seconds": round(time.time() - started, 1),
             "near_tolerance_pct": round(args.near_tolerance * 100, 1),
             "structure_tolerance_pct": round(args.structure_tolerance * 100, 1),
+            "max_contraction": round(args.max_contraction, 2),
             "warnings": warnings[:20],
             "disclaimer": "仅供量化研究与复盘，不构成投资建议。盘中信号尚未收盘确认。",
         },
-        "market": {
-            "breadth": round(breadth * 100, 1),
-            "state": market_state,
-            "median_r20_pct": pct(market_r20),
-        },
+        "market": {"breadth": round(breadth * 100, 1), "state": market_state, "median_r20_pct": pct(market_r20)},
         "summary": {
             "total": len(selected),
-            "confirmed": counts["A"] + counts["B"] + counts["C"] + counts["D"],
-            "A": counts["A"],
-            "B": counts["B"],
-            "C": counts["C"],
-            "D": counts["D"],
-            "W": counts["W"],
+            "B1": counts["B1"], "B2": counts["B2"], "B3": counts["B3"], "B4": counts["B4"],
         },
         "diagnostics": {
             "stages": dict(stage_counts.most_common()),
-            "explanation": "V4.4仅认可最新K线确认；按买点一均线、买点二前波峰、买点三邻近波谷、买点四更低历史波谷依次识别。",
+            "explanation": "V5.0只认最新K线：阳线、实体大于上一根、量能大于上一根。主策略只用MA20；买点二/三/四依次使用前高、前低、历史更低波谷支撑。",
         },
         "industry_ranking": industry_ranking,
         "candidates": selected,
     }
     write_outputs(payload)
-    print(
-        f"完成：买点一 {counts['A']} / 买点二 {counts['B']} / 买点三 {counts['C']} / 买点四 {counts['D']} / 等待确认 {counts['W']}，"
-        f"总候选 {len(selected)}，耗时 {payload['meta']['elapsed_seconds']} 秒"
-    )
+    print(f"完成：买点一 {counts['B1']} / 买点二 {counts['B2']} / 买点三 {counts['B3']} / 买点四 {counts['B4']}；总候选 {len(selected)}，耗时 {payload['meta']['elapsed_seconds']} 秒")
     return 0
 
 
